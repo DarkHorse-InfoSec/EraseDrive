@@ -85,8 +85,18 @@ function Start-EraseDriveGUI {
     $script:disposables.Add($fontLog)
 
     # ── Module path for background runspace ───────────────────────────────────
-    # When dot-sourced from EraseDrive.psm1, $PSScriptRoot is the EraseDrive\ directory
-    $modulePath = Join-Path $PSScriptRoot 'EraseDrive.psd1'
+    # Inside a function dot-sourced from Public\Start-EraseDriveGUI.ps1, $PSScriptRoot
+    # is the Public\ directory (not the module root). The .psd1 lives one level up.
+    # Prefer the loaded module's own manifest path when available, fall back to the
+    # parent-of-PSScriptRoot construction.
+    $modulePath = $null
+    $loadedModule = Get-Module -Name EraseDrive
+    if ($loadedModule -and $loadedModule.Path) {
+        $modulePath = $loadedModule.Path
+    }
+    else {
+        $modulePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'EraseDrive.psd1'
+    }
 
     # ── Background operation state ────────────────────────────────────────────
     $script:ps = $null
