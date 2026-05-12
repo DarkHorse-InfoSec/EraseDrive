@@ -14,7 +14,7 @@
 #>
 
 BeforeAll {
-    $modulePath = Join-Path $PSScriptRoot '..' 'EraseDrive'
+    $modulePath = Join-Path (Join-Path $PSScriptRoot '..') 'EraseDrive'
 
     # Set up module config in script scope so functions can find it
     $Script:EraseDriveConfig = @{
@@ -39,7 +39,7 @@ BeforeAll {
 # ============================================================================
 Describe 'Module Structure' {
     BeforeAll {
-        $modulePath = Join-Path $PSScriptRoot '..' 'EraseDrive'
+        $modulePath = Join-Path (Join-Path $PSScriptRoot '..') 'EraseDrive'
         $manifestPath = Join-Path $modulePath 'EraseDrive.psd1'
         $manifest = Test-ModuleManifest -Path $manifestPath -ErrorAction Stop
     }
@@ -1406,7 +1406,7 @@ Describe 'Invoke-SecureDiskErase - Round 2 Features' {
 # ============================================================================
 Describe 'Start-EraseDrive.ps1 CLI -Force flag' {
     BeforeAll {
-        $scriptPath = Join-Path $PSScriptRoot '..' 'Start-EraseDrive.ps1'
+        $scriptPath = Join-Path (Join-Path $PSScriptRoot '..') 'Start-EraseDrive.ps1'
     }
 
     It 'Script file exists and can be found' {

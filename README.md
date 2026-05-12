@@ -84,12 +84,42 @@ erase-drive/
    ```powershell
    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
-3. No additional modules are required. The module self-loads from `Start-EraseDrive.ps1`.
+3. **If you downloaded a ZIP from GitHub**, Windows marks every extracted file as
+   coming from the internet (Mark-of-the-Web / Zone.Identifier ADS). Even with
+   `RemoteSigned`, unsigned downloaded scripts are blocked. Unblock the folder
+   recursively after extracting:
+   ```powershell
+   Get-ChildItem -Path .\EraseDrive-main -Recurse | Unblock-File
+   ```
+   Alternatively, launch a single session with `-ExecutionPolicy Bypass`:
+   ```powershell
+   powershell.exe -ExecutionPolicy Bypass -File .\Start-EraseDrive.ps1
+   ```
+4. No additional modules are required. The module self-loads from `Start-EraseDrive.ps1`.
 
-To import the module directly in your own scripts:
+To import the module directly in your own scripts (from the extracted folder):
 ```powershell
 Import-Module .\EraseDrive -Force
 ```
+
+### Optional: Install as a user/system module
+
+If you'd rather invoke EraseDrive cmdlets from anywhere instead of running
+`Start-EraseDrive.ps1` from the extracted folder, copy the `EraseDrive/` module
+folder into a directory on `$env:PSModulePath`:
+
+```powershell
+# Current user (recommended, no admin elevation required for copy step)
+$dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Modules\EraseDrive'
+Copy-Item -Path .\EraseDrive -Destination $dest -Recurse -Force
+
+# All users (requires elevated PowerShell)
+Copy-Item -Path .\EraseDrive -Destination "$env:ProgramFiles\WindowsPowerShell\Modules\EraseDrive" -Recurse -Force
+```
+
+After this, `Import-Module EraseDrive` works from any directory, and the
+public cmdlets (`Invoke-ForensicUserDataWipe`, `Invoke-SecureDiskErase`,
+`Start-EraseDriveGUI`) are available globally.
 
 ## Usage: GUI Mode
 
@@ -331,10 +361,25 @@ Invoke-Pester -Path .\Tests\EraseDrive.Tests.ps1 -Output Detailed -CodeCoverage 
 ### "Cannot find type [System.Windows.Forms.Button]"
 Run as Administrator. The .NET Framework WinForms assembly requires elevation on some systems.
 
-### "Execution Policy" Error
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
+### "Execution Policy" Error / "File is not digitally signed"
+
+The script files extracted from a GitHub ZIP carry a Mark-of-the-Web zone
+identifier that blocks them under `RemoteSigned` even after you change the
+execution policy. You have two options:
+
+1. **Unblock the files** (preferred, one-time fix):
+   ```powershell
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+   Get-ChildItem -Path .\EraseDrive-main -Recurse | Unblock-File
+   ```
+
+2. **Bypass the policy for a single invocation**:
+   ```powershell
+   powershell.exe -ExecutionPolicy Bypass -File .\Start-EraseDrive.ps1
+   ```
+
+If you cloned with `git clone` rather than downloading a ZIP, the MOTW marker
+is not applied and `RemoteSigned` alone is sufficient.
 
 ### "No suitable disks found"
 Normal if you only have one system disk. The system disk appears in blue and supports user data wipe only.
