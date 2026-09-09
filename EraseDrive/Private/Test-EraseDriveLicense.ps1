@@ -75,9 +75,17 @@ function Test-EraseDriveLicense {
 
     # ── Resolve license path ─────────────────────────────────────────────
     if (-not $LicensePath) {
-        $candidates = @(
-            (Join-Path $env:ProgramData 'DarkHorse\EraseDrive\license.lic')
-        )
+        $candidates = @()
+
+        # The loaded module configuration is authoritative. The public key
+        # resolution below already prefers it; leaving it out here gave one
+        # value two sources of truth, so a redirected LicensePath was silently
+        # ignored and every license read as Free.
+        if ($Script:EraseDriveConfig -and $Script:EraseDriveConfig.LicensePath) {
+            $candidates += $Script:EraseDriveConfig.LicensePath
+        }
+
+        $candidates += (Join-Path $env:ProgramData 'DarkHorse\EraseDrive\license.lic')
 
         # Add repo-root fallback when running from a checked-out source tree
         try {
