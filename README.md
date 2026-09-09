@@ -6,6 +6,27 @@ A professional PowerShell module for secure data destruction on Windows systems.
 
 **This tool permanently destroys data. There is no undo.** Always ensure important data is backed up before proceeding with any wipe operation. Verify you are selecting the correct target before executing.
 
+## Pricing (v3.1)
+
+EraseDrive is freemium. The wipe is always free. The signed PDF Certificate of Destruction requires a paid license.
+
+| Tier | Price       | Includes |
+|------|-------------|----------|
+| Free | $0          | Unlimited wipes. Text (.txt) certificate with HMAC-SHA256 integrity signature. |
+| Pro  | $99 once    | Lifetime. Signed PDF Certificate of Destruction. All future versions. |
+| Team | $499 / yr   | 5 technicians (honor system). All Pro features. |
+| MSP  | $1499 / yr  | Unlimited technicians, multi-tenant. All Team features. |
+
+Buy at [erasedrive.io](https://erasedrive.io) or directly via Gumroad. The license file is emailed within 24 hours of purchase.
+
+**Activating a license:**
+
+1. Save the `license.lic` you received to `%ProgramData%\DarkHorse\EraseDrive\license.lic`. You may need to create the folder if EraseDrive has never been run on this machine.
+2. (Or, in the GUI) click "LOAD LICENSE" and select your `.lic` file.
+3. The header badge changes from `TIER: FREE` to `TIER: PRO` (or Team / MSP). Future wipes generate both `.txt` and `.pdf` certificates.
+
+EraseDrive does not phone home. License validation is entirely offline: the `.lic` is RSA-signed by DarkHorse InfoSec and verified locally against an embedded public key. Safe to run on air-gapped networks.
+
 ## What's New in v3.0
 
 - **Proper PowerShell module** - Replaces the monolithic `erase_drive.ps1` with a structured `EraseDrive` module (manifest, public/private functions, Pester tests)
@@ -132,6 +153,19 @@ Run headless for automation, scripting, and MDT/SCCM task sequences.
 .\Start-EraseDrive.ps1 -Mode CLI -Operation UserWipe -Method Secure -ClearEventLogs -Confirm
 ```
 
+### Device Reissue Wipe
+
+```powershell
+# Offline, from the WinPE boot stick. The complete wipe.
+.\Start-EraseDrive.ps1 -Mode CLI -Operation ReissueWipe -OfflineRoot C:\ -RemoveFromDomain -Method Secure -Force
+
+# Live, with sysprep, ready to hand over
+.\Start-EraseDrive.ps1 -Mode CLI -Operation ReissueWipe -RemoveFromDomain -Generalize -Force
+```
+
+Exit codes: `0` wipe complete, `2` succeeded but remnants remain (see the printed list),
+`1` failed. A partial wipe never exits `0`.
+
 ### Complete Disk Erasure
 
 ```powershell
@@ -176,6 +210,89 @@ Parameters: -Mode CLI -Operation DiskErase -DiskNumber 1 -Method Secure -Force -
 The `-Force` flag suppresses interactive confirmation prompts. The script returns exit code `0` on success and `1` on failure, compatible with task sequence error handling.
 
 ## Operations
+
+### Device Reissue Wipe
+
+Returns a device to a clean state so it can be handed to a different employee or sold,
+with Windows still installed. This is the operation to use when the business has finished
+with a machine.
+
+Run it two ways, and the difference is not cosmetic:
+
+| | Offline (recommended) | Live |
+|---|---|---|
+| How | Boot the EraseDrive WinPE stick, pass `-OfflineRoot` | Run against the running Windows |
+| Every user profile removable | Yes | No, the operator's own survives |
+| Cached domain credentials (`HKLM\SECURITY`) | Yes | Only if running as SYSTEM |
+| `pagefile.sys` / `hiberfil.sys` | Deleted | Scheduled for clearing on shutdown |
+| Can be complete | Yes | No |
+
+A live wipe is convenient and is structurally incapable of being complete. It reports every
+remnant it could not remove in `Unreachable` rather than glossing over them, and the CLI
+exits `2` rather than `0` when the wipe succeeded but left remnants behind.
+
+**What it removes:**
+- All user profiles, their registry hives, and their ProfileList records
+- Cached domain logon verifiers (`NL$1`..`NL$10`) and the `NL$KM` key that decrypts them
+- Machine-wide Credential Manager vaults and Windows Hello / NGC containers
+- Volume Shadow Copies and System Restore points, which otherwise still hold the deleted data
+- `pagefile.sys`, `hiberfil.sys` and `swapfile.sys`
+- The Recycle Bin on every volume, not just the system volume
+- Saved wireless profiles, the NetworkList history, VPN phonebooks, network printers, proxy
+  and hosts entries
+- USB device history (USBSTOR, MountedDevices), Windows Timeline, `Windows.old`, Windows
+  Update and Delivery Optimization caches, cached Group Policy
+- Domain membership and the machine account secret, with `-RemoveFromDomain`
+
+**What it preserves:**
+- Windows, installed programs, and boot capability
+- **Active Directory. Nothing in this tool writes to the directory.** `-RemoveFromDomain`
+  removes the *device* from the domain. User accounts are untouched, so a departing user
+  signs in on their next machine exactly as before, and the computer object is left in
+  place for your normal stale-object cleanup.
+
+**Optional `-Generalize`** runs `sysprep /generalize /oobe` afterwards so the device boots
+to out-of-box setup like a new machine. It is opt-in because it consumes one of a limited
+number of rearms, requires the machine to be unjoined first, and fails on per-user
+provisioned Store apps. All three are checked before anything starts, and a failed check
+returns a refusal naming the reason rather than aborting part way through.
+
+```powershell
+# Recommended: boot the WinPE stick, then wipe the internal install
+Invoke-DeviceReissueWipe -OfflineRoot C:\ -RemoveFromDomain -WipeMethod Secure
+
+# Live, finishing with sysprep so it boots to OOBE and shuts down ready to hand over
+Invoke-DeviceReissueWipe -RemoveFromDomain -Generalize
+
+# Preview everything without changing anything
+Invoke-DeviceReissueWipe -OfflineRoot C:\ -WhatIf
+```
+
+### Bootable WinPE Media
+
+`New-EraseDriveBootMedia` builds the USB stick that makes an offline wipe possible.
+Requires the Windows ADK and the WinPE add-on.
+
+```powershell
+New-EraseDriveBootMedia -UsbDriveLetter E      # erases E:
+New-EraseDriveBootMedia -IsoPath D:\PE.iso     # for a VM or out-of-band management
+```
+
+The target must be removable media. A fixed disk is refused outright rather than
+confirmed, because `MakeWinPEMedia` erases the target completely.
+
+**BitLocker.** A corporate device is usually encrypted, and an encrypted volume is
+unreadable from WinPE until unlocked, so the wipe will correctly report that it found no
+Windows installation. The image ships `manage-bde` and the boot script flags locked
+volumes on startup:
+
+```
+manage-bde -unlock C: -RecoveryPassword <48-digit key>
+```
+
+**Evidence stays with you.** Logs and the Certificate of Destruction are written to the
+directory EraseDrive was launched from, which on the boot stick is the stick itself, not
+the machine being handed over. Override with `-EvidencePath`.
 
 ### Forensic User Data Wipe
 
@@ -349,7 +466,15 @@ Logs are stored in `%ProgramData%\DarkHorse\EraseDrive\EraseDrive.log` with auto
 
 ## Version History
 
-### v3.0.0 (Current)
+### v3.1.0 (Current)
+- Signed PDF Certificate of Destruction (Pro+ license tier)
+- License-key file model (RSA-2048 signed, offline validation)
+- "Load License..." button in GUI, tier badge in header
+- License tier banner in CLI startup output
+- Inno Setup-based code-signable installer (`installer/EraseDrive.iss`)
+- Pricing tiers: Free (text cert only), Pro $99 lifetime, Team $499/yr, MSP $1499/yr
+
+### v3.0.0
 - Complete module restructure (Public/Private function split)
 - CLI automation mode with `-Force` flag for MDT/SCCM
 - SSD-aware media type and protocol detection
@@ -393,4 +518,4 @@ This tool is provided as-is for legitimate data destruction purposes. Users are 
 
 ---
 
-**DarkHorse InfoSec** - EraseDrive v3.0.0
+**DarkHorse InfoSec** - EraseDrive v3.1.0
