@@ -37,3 +37,7 @@ installer/Output/
 # audit logs must never be committed.
 EraseDrive-Evidence/
 dist/
+
+# Internal planning notes. Kept local, never published: they carry personal
+# contact details, internal machine paths and commercial reasoning.
+tasks/
