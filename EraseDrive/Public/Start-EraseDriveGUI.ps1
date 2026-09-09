@@ -548,7 +548,10 @@ function Start-EraseDriveGUI {
     $lblMethod.Font      = $fontNormal
 
     $cmbMethod = New-Object System.Windows.Forms.ComboBox
-    $cmbMethod.Items.AddRange(@('Standard', 'Secure'))
+    # Standard is index 0 and stays the default: it is the one that actually
+    # sanitizes and verifies. Quick is listed last so it cannot be picked by
+    # accident, and its label says what it does not do.
+    $cmbMethod.Items.AddRange(@('Standard', 'Secure', 'Quick'))
     $cmbMethod.SelectedIndex  = 0
     $cmbMethod.Location       = New-Object System.Drawing.Point(650, 14)
     $cmbMethod.Size           = New-Object System.Drawing.Size(100, 25)
@@ -949,6 +952,23 @@ function Start-EraseDriveGUI {
         }
         else {
             'Leave the disk raw (no drive letter)'
+        }
+
+        # Quick does not overwrite anything. Someone reaching for it to decommission
+        # a machine must be told, before the partition table goes, that the data
+        # will still be there.
+        if ($method -eq 'Quick') {
+            $quickWarn = [System.Windows.Forms.MessageBox]::Show(
+                "QUICK does not erase data.`n`n" +
+                "It removes the partition table and nothing else. Every file on this" +
+                "`ndisk stays on the media and can be recovered with ordinary tools." +
+                "`n`nThe certificate will state that no sanitization was performed and" +
+                "`nwill make no compliance claim." +
+                "`n`nUse Standard or Secure to actually destroy the data." +
+                "`n`nContinue with QUICK anyway?",
+                'Quick does not sanitize', 'YesNo', 'Warning'
+            )
+            if ($quickWarn -ne 'Yes') { return }
         }
 
         # First confirmation

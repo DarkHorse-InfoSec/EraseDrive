@@ -135,12 +135,24 @@ function New-ErasureCertificate {
 
         $border = '=' * 80
 
-        # Determine method description
-        $methodDescription = switch ($Method) {
-            'Standard' { 'NIST 800-88 Clear (single pass)' }
-            'Secure'   { 'NIST 800-88 Clear (3-pass: zeros, ones, random)' }
-            default    { $Method }
+        # Determine method description.
+        #
+        # These strings are a compliance claim, so each one must describe what the
+        # corresponding code path actually does. Until 2026-09-09 'Standard' was
+        # labelled a single-pass NIST Clear here while the code performed no pass at
+        # all, and 'Secure' was labelled a NIST 3-pass when the sequence
+        # zeros/ones/random is DoD 5220.22-M, which NIST superseded.
+        $methodDescription = switch -Regex ($Method) {
+            '^Quick'    { 'Partition removal only. NO overwrite performed. NOT a sanitization method.' }
+            '^Standard' { 'NIST SP 800-88 Rev.1 Clear (single-pass zero overwrite)' }
+            '^Secure'   { 'NIST SP 800-88 Rev.1 Clear (multi-pass overwrite, DoD 5220.22-M style)' }
+            default     { $Method }
         }
+
+        # A compliance claim is only made when the method sanitizes AND the result
+        # was verified. Everything else states plainly what is missing.
+        $isSanitizing = ($Method -notmatch '^Quick')
+        $isVerified   = ($null -ne $VerificationResult -and $VerificationResult.Verified)
 
         $sb = [System.Text.StringBuilder]::new(4096)
 
@@ -213,9 +225,26 @@ function New-ErasureCertificate {
 
         # ---- Compliance ----
         [void]$sb.AppendLine('--- COMPLIANCE ---')
-        [void]$sb.AppendLine('This erasure follows NIST SP 800-88 Rev.1 Clear guidelines.')
-        [void]$sb.AppendLine('For SSD Purge-level assurance, manufacturer-specific tools')
-        [void]$sb.AppendLine('are recommended in addition to this process.')
+        if (-not $isSanitizing) {
+            [void]$sb.AppendLine('NO COMPLIANCE CLAIM IS MADE BY THIS CERTIFICATE.')
+            [void]$sb.AppendLine('The method used removed partitioning only and did not overwrite')
+            [void]$sb.AppendLine('any data. The contents of this device remain recoverable. This')
+            [void]$sb.AppendLine('does not meet NIST SP 800-88 Rev.1 Clear, Purge or Destroy.')
+        }
+        elseif (-not $isVerified) {
+            [void]$sb.AppendLine('COMPLIANCE NOT ESTABLISHED: the overwrite was performed but its')
+            [void]$sb.AppendLine('result was NOT VERIFIED. NIST SP 800-88 Rev.1 section 4.7 requires')
+            [void]$sb.AppendLine('verification of sanitization results, so this certificate does not')
+            [void]$sb.AppendLine('assert Clear. Re-run with verification enabled before relying on')
+            [void]$sb.AppendLine('this device having been sanitized.')
+        }
+        else {
+            [void]$sb.AppendLine('This erasure meets NIST SP 800-88 Rev.1 Clear: every addressable')
+            [void]$sb.AppendLine('location was overwritten and the result was verified by sampling')
+            [void]$sb.AppendLine('per section 4.7.')
+            [void]$sb.AppendLine('For SSD Purge-level assurance, the drive vendor''s own sanitize or')
+            [void]$sb.AppendLine('cryptographic-erase command is required in addition to this process.')
+        }
         [void]$sb.AppendLine()
 
         # ---- Additional Notes ----

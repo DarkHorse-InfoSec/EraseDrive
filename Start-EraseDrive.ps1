@@ -26,7 +26,13 @@
     CLI mode, DiskErase only. The disk number to erase.
 
 .PARAMETER Method
-    Wipe method: 'Standard' (fast) or 'Secure' (multi-pass overwrite).
+    Wipe method.
+      Quick    - removes partitioning only, writes nothing. NOT a sanitization;
+                 the data remains recoverable and no compliance claim is made.
+      Standard - removes partitioning and overwrites every sector once with zeros.
+                 NIST SP 800-88 Rev.1 Clear. This is the default.
+      Secure   - media-aware deep erase: multi-pass overwrite on rotational media,
+                 full-device zero fill on SSDs.
     Default: 'Standard'
 
 .PARAMETER ClearEventLogs
@@ -123,7 +129,7 @@ param(
 
     [int]$DiskNumber = -1,
 
-    [ValidateSet('Standard', 'Secure')]
+    [ValidateSet('Quick', 'Standard', 'Secure')]
     [string]$Method = 'Standard',
 
     [switch]$ClearEventLogs,

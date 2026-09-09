@@ -599,6 +599,7 @@ Describe 'Invoke-ForensicUserDataWipe' {
                 PassesCompleted  = 1
                 Duration         = [timespan]::FromSeconds(1)
                 Message          = 'Mock overwrite complete'
+                FinalPattern     = [byte]0x00
             }
         }
     }
@@ -714,6 +715,7 @@ Describe 'Invoke-SecureDiskErase' {
                 PassesCompleted  = 3
                 Duration         = [timespan]::FromMinutes(30)
                 Message          = 'Overwrite complete'
+                FinalPattern     = [byte]0x00
             }
         }
 
@@ -1273,6 +1275,7 @@ Describe 'Invoke-SecureDiskErase - Round 2 Features' {
                 PassesCompleted  = 3
                 Duration         = [timespan]::FromMinutes(30)
                 Message          = 'Overwrite complete'
+                FinalPattern     = [byte]0x00
             }
         }
 

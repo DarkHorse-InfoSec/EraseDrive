@@ -106,6 +106,7 @@ Describe 'Invoke-SecureDiskErase -Reformat' {
                 PassesCompleted  = 3
                 Duration         = [timespan]::FromMinutes(30)
                 Message          = 'Overwrite complete'
+                FinalPattern     = [byte]0x00
             }
         }
 

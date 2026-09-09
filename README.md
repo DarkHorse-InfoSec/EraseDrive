@@ -225,6 +225,34 @@ Exit codes: `0` wipe complete, `2` succeeded but remnants remain (see the printe
     -Reformat -ReformatFileSystem exFAT -ReformatLabel RECOVERED
 ```
 
+### Erase methods, and what each one actually does
+
+| Method | What it does | Compliance |
+|---|---|---|
+| `Quick` | Removes the partition table. **Writes nothing.** Data stays on the media and is recoverable with ordinary tools. | **None claimed.** Not a sanitization. |
+| `Standard` **(default)** | Removes the partition table, then overwrites every addressable sector once with zeros. | NIST SP 800-88 Rev.1 **Clear**, once verified. |
+| `Secure` | Media-aware: multi-pass overwrite on rotational media, full-device zero fill (`diskpart clean all`) on SSDs. | NIST SP 800-88 Rev.1 **Clear**, once verified. |
+
+Two things worth being clear about, because the industry is usually not:
+
+**`Secure` is not more NIST-compliant than `Standard`.** Both reach Clear. NIST
+SP 800-88 Rev.1 Appendix A states that a single overwrite pass with a fixed
+pattern hinders recovery even against laboratory techniques; the multi-pass
+zeros/ones/random sequence is DoD 5220.22-M, which NIST superseded. `Secure`
+exists because procurement and audit checklists still ask for it.
+
+**Neither reaches Purge on an SSD.** Purge needs the drive's own sanitize or
+cryptographic-erase command. Overwriting an SSD cannot reach over-provisioned or
+wear-levelled blocks. The certificate says so rather than implying otherwise.
+
+**Verification is part of the standard, not an extra.** Section 4.7 of
+SP 800-88 Rev.1 requires that sanitization results be verified, so EraseDrive
+samples sectors afterwards and checks them against the byte the erase actually
+wrote. **A certificate only asserts NIST Clear when that verification passed.**
+If the overwrite ran but was not confirmed, the certificate says
+`COMPLIANCE NOT ESTABLISHED`; if `Quick` was used, it says
+`NO COMPLIANCE CLAIM IS MADE BY THIS CERTIFICATE`.
+
 ### After an erase, the disk is RAW. That is normal.
 
 Erasing removes the partition table along with the data, so a successfully erased
@@ -438,7 +466,7 @@ After a Secure erase, EraseDrive performs a verification pass:
 4. Reads each 512-byte sector and compares against expected post-erase pattern (0x00)
 5. Reports pass/fail count, failed sector offsets, and coverage percentage
 
-Verification results are included in the erasure certificate. Use `-SkipVerification` to bypass (not recommended).
+Verification samples are compared against the byte the erase actually wrote, which is carried through from the method that wrote it rather than assumed. A certificate asserts NIST SP 800-88 Clear only when that verification passed. Use `-SkipVerification` to bypass (not recommended, and it also disables `-Reformat`).
 
 ## Erasure Certificates
 

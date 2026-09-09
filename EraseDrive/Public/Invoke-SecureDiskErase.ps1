@@ -9,7 +9,14 @@ function Invoke-SecureDiskErase {
         boot disk), then queries hardware characteristics to select the optimal erasure
         strategy.
 
-        Standard method uses Clear-Disk to remove all partition, volume, and OEM data.
+        Quick removes the partition table with Clear-Disk and writes nothing to the
+        media. It is NOT a sanitization method: the data remains on the disk and is
+        recoverable with ordinary tools. It exists for repartitioning, produces no
+        compliance claim, and is not verified.
+
+        Standard removes the partition table and then overwrites every addressable
+        sector once with zeros. That is NIST SP 800-88 Rev.1 Clear, and it is the
+        default.
 
         Secure method applies media-appropriate deep erasure:
         - HDD: Clear-Disk followed by a 3-pass overwrite of the raw physical device
@@ -33,8 +40,16 @@ function Invoke-SecureDiskErase {
         The disk number to erase (as shown by Get-Disk or Disk Management).
 
     .PARAMETER EraseMethod
-        'Standard' performs a fast partition/volume removal. 'Secure' performs media-aware
-        deep erasure. Default: Standard
+        'Quick' removes partitioning only and writes nothing. NOT sanitization, and
+        it makes no compliance claim. 'Standard' (default) removes partitioning and
+        overwrites every sector once with zeros: NIST SP 800-88 Rev.1 Clear.
+        'Secure' performs media-aware deep erasure, a 3-pass overwrite on rotational
+        media or a full-device zero fill on SSDs.
+
+        Note that 'Secure' is not more NIST-compliant than 'Standard'. Both reach
+        Clear; the extra passes are there because audit checklists still ask for
+        them. Neither reaches Purge on an SSD, which needs the drive's own sanitize
+        or crypto-erase command.
 
     .PARAMETER SkipVerification
         When specified, skips the post-erase sector verification step. Not recommended
@@ -128,7 +143,7 @@ function Invoke-SecureDiskErase {
         [int]$DiskNumber,
 
         [Parameter()]
-        [ValidateSet('Standard', 'Secure')]
+        [ValidateSet('Quick', 'Standard', 'Secure')]
         [string]$EraseMethod = 'Standard',
 
         [Parameter()]
@@ -166,6 +181,13 @@ function Invoke-SecureDiskErase {
     $reformatted = $false
     $reformatMessage = $null
     $reformatDriveLetter = $null
+
+    # The byte this run leaves across the media, and therefore the byte verification
+    # must expect. $null means "nothing predictable was written", which is a
+    # DIFFERENT state from "zeros were written" even though 0x00 is falsy. Always
+    # compare with `$null -eq $finalPattern`; `if ($finalPattern)` is false for the
+    # commonest success case and would silently skip verification.
+    $finalPattern = $null
 
     # Helper to invoke progress callback safely
     $reportStep = {
@@ -344,12 +366,35 @@ function Invoke-SecureDiskErase {
         }
 
         # ── 4. Perform erasure ───────────────────────────────────────────
-        if ($EraseMethod -eq 'Standard') {
-            # ── Standard: Clear-Disk only ────────────────────────────────
+        if ($EraseMethod -eq 'Quick') {
+            # ── Quick: remove partitioning, write nothing ────────────────
+            #
+            # This leaves the user data intact and recoverable. It is offered for
+            # repartitioning, not for decommissioning, and $finalPattern stays $null
+            # so that nothing downstream can verify or certify it as sanitized.
 
-            # Timeout check before Clear-Disk
             if (& $checkTimeout) {
-                return (& $handleTimeoutAbort $diskDescription 'Standard (Clear-Disk)' $diskSerial $diskModel $diskSizeGB)
+                return (& $handleTimeoutAbort $diskDescription 'Quick (Clear-Disk, no overwrite)' $diskSerial $diskModel $diskSizeGB)
+            }
+
+            & $reportStep 10 'Removing partitions' 'Clear-Disk (Quick, no overwrite)'
+            Write-OperationLog -Message "Executing Clear-Disk for disk $DiskNumber (Quick). NOTE: Quick writes nothing to the media; data remains recoverable." -LogLevel 'WARNING'
+
+            & $assertDiskIdentity
+            Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
+            Write-OperationLog -Message "Clear-Disk completed for disk $DiskNumber (Quick)" -LogLevel 'SUCCESS'
+
+            & $reportStep 70 'Partitions removed' 'Quick finished (no data was overwritten)'
+        }
+        elseif ($EraseMethod -eq 'Standard') {
+            # ── Standard: Clear-Disk + single-pass zero fill ─────────────
+            #
+            # The single fixed-pattern pass is what makes this NIST 800-88 Clear.
+            # Before 2026-09-09 this branch ran Clear-Disk alone, wrote nothing, and
+            # then failed its own verification while the certificate claimed Clear.
+
+            if (& $checkTimeout) {
+                return (& $handleTimeoutAbort $diskDescription 'Standard (Clear-Disk + single-pass zero overwrite)' $diskSerial $diskModel $diskSizeGB)
             }
 
             & $reportStep 10 'Erasing disk' 'Clear-Disk (Standard)'
@@ -357,7 +402,30 @@ function Invoke-SecureDiskErase {
 
             & $assertDiskIdentity
             Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
-            Write-OperationLog -Message "Clear-Disk completed for disk $DiskNumber" -LogLevel 'SUCCESS'
+            Write-OperationLog -Message "Clear-Disk completed for disk $DiskNumber" -LogLevel 'INFO'
+
+            if (& $checkTimeout) {
+                return (& $handleTimeoutAbort $diskDescription 'Standard (Clear-Disk + single-pass zero overwrite)' $diskSerial $diskModel $diskSizeGB)
+            }
+
+            & $reportStep 20 'Overwriting disk' 'Single-pass zero overwrite of the raw device'
+            $targetPath = "\\.\PhysicalDrive$DiskNumber"
+            Write-OperationLog -Message "Starting single-pass zero overwrite on $targetPath" -LogLevel 'INFO'
+
+            & $assertDiskIdentity
+            $overwriteResult = Invoke-SecureOverwrite -TargetPath $targetPath -Passes 1 -ReportProgress {
+                param($info)
+                & $reportStep ([int](20 + ($info.PercentComplete * 0.45))) 'Overwriting disk' "Pass $($info.Pass) of $($info.TotalPasses)"
+            }
+
+            if ($overwriteResult.Success) {
+                $finalPattern = $overwriteResult.FinalPattern
+                Write-OperationLog -Message "Standard overwrite completed: $($overwriteResult.BytesOverwritten) bytes, $($overwriteResult.Duration)" -LogLevel 'SUCCESS'
+            }
+            else {
+                Write-OperationLog -Message "Standard overwrite issue: $($overwriteResult.Message)" -LogLevel 'ERROR'
+                throw "Single-pass overwrite failed: $($overwriteResult.Message)"
+            }
 
             & $reportStep 70 'Erase complete' 'Standard erase finished'
         }
@@ -395,6 +463,7 @@ function Invoke-SecureDiskErase {
                 }
 
                 if ($overwriteResult.Success) {
+                    $finalPattern = $overwriteResult.FinalPattern
                     Write-OperationLog -Message "HDD overwrite completed: $($overwriteResult.BytesOverwritten) bytes, $($overwriteResult.PassesCompleted) passes, $($overwriteResult.Duration)" -LogLevel 'SUCCESS'
                 }
                 else {
@@ -431,6 +500,8 @@ function Invoke-SecureDiskErase {
 
                         if ($diskpartExitCode -eq 0 -and ($diskpartOutput -join "`n") -match 'succeeded') {
                             $ssdEraseSuccess = $true
+                            # 'clean all' zero-fills every sector, so the media is left at 0x00.
+                            $finalPattern = [byte]0x00
                             Write-OperationLog -Message "diskpart clean all completed successfully for SATA SSD disk $DiskNumber" -LogLevel 'SUCCESS'
                         }
                         else {
@@ -469,6 +540,8 @@ function Invoke-SecureDiskErase {
 
                         if ($diskpartExitCode -eq 0 -and ($diskpartOutput -join "`n") -match 'succeeded') {
                             $ssdEraseSuccess = $true
+                            # 'clean all' zero-fills every sector, so the media is left at 0x00.
+                            $finalPattern = [byte]0x00
                             Write-OperationLog -Message "diskpart clean all completed successfully for NVMe SSD disk $DiskNumber" -LogLevel 'SUCCESS'
                         }
                         else {
@@ -503,6 +576,8 @@ function Invoke-SecureDiskErase {
 
                         if ($diskpartExitCode -eq 0 -and ($diskpartOutput -join "`n") -match 'succeeded') {
                             $ssdEraseSuccess = $true
+                            # 'clean all' zero-fills every sector, so the media is left at 0x00.
+                            $finalPattern = [byte]0x00
                             Write-OperationLog -Message "diskpart clean all completed for $protocol SSD disk $DiskNumber" -LogLevel 'SUCCESS'
                         }
                         else {
@@ -548,6 +623,7 @@ function Invoke-SecureDiskErase {
                     }
 
                     if ($overwriteResult.Success) {
+                        $finalPattern = $overwriteResult.FinalPattern
                         Write-OperationLog -Message "Fallback SSD overwrite completed: $($overwriteResult.BytesOverwritten) bytes, $($overwriteResult.Duration)" -LogLevel 'WARNING'
                     }
                     else {
@@ -570,11 +646,30 @@ function Invoke-SecureDiskErase {
                 return (& $handleTimeoutAbort $diskDescription $EraseMethod $diskSerial $diskModel $diskSizeGB)
             }
 
+            # `$null -eq` and not `-not $finalPattern`: a legitimate pattern of
+            # 0x00 is the commonest outcome and is falsy, so a truthiness test here
+            # would skip verification on exactly the runs that most need it.
+            if ($null -eq $finalPattern) {
+                $verificationSkipReason = if ($EraseMethod -eq 'Quick') {
+                    'Verification skipped: Quick writes nothing to the media, so there is no pattern to verify and nothing was sanitized.'
+                }
+                else {
+                    'Verification skipped: the erase did not leave a predictable pattern on the media (an incomplete pass, or a random final pass), so sampling cannot confirm it.'
+                }
+                Write-OperationLog -Message $verificationSkipReason -LogLevel 'WARNING'
+                & $reportStep 85 'Verification skipped' $verificationSkipReason
+            }
+            else {
+
             & $reportStep 75 'Verifying erasure' 'Post-erase sector sampling'
-            Write-OperationLog -Message "Starting post-erase verification for disk $DiskNumber" -LogLevel 'INFO'
+            Write-OperationLog -Message "Starting post-erase verification for disk $DiskNumber against expected byte 0x$($finalPattern.ToString('X2'))" -LogLevel 'INFO'
 
             try {
-                $verificationResult = Test-EraseVerification -DiskNumber $DiskNumber
+                # The expected pattern is not a constant here. It is the byte the
+                # erase actually wrote, carried through from the method that wrote
+                # it. Hardcoding 0x00 at this call site while a method wrote
+                # something else is the defect this parameter exists to prevent.
+                $verificationResult = Test-EraseVerification -DiskNumber $DiskNumber -ExpectedPattern $finalPattern
 
                 if ($verificationResult.Verified) {
                     $verified = $true
@@ -589,6 +684,8 @@ function Invoke-SecureDiskErase {
             }
 
             & $reportStep 85 'Verification complete' $(if ($verified) { 'Erase verified' } else { 'Verification did not pass' })
+
+            }
         }
         else {
             Write-OperationLog -Message 'Post-erase verification skipped by user request.' -LogLevel 'INFO'
@@ -691,7 +788,8 @@ function Invoke-SecureDiskErase {
 
         try {
             $methodDescription = switch ($EraseMethod) {
-                'Standard' { 'Standard (Clear-Disk)' }
+                'Quick'    { 'Quick (Clear-Disk only, NO overwrite, NOT a sanitization method)' }
+                'Standard' { 'Standard (Clear-Disk + single-pass zero overwrite)' }
                 'Secure' {
                     if ($mediaType -eq 'SSD' -and $protocol -eq 'NVMe') { 'Secure (NVMe diskpart clean all)' }
                     elseif ($mediaType -eq 'SSD' -and $protocol -eq 'SATA') { 'Secure (SATA diskpart clean all)' }
@@ -738,6 +836,9 @@ function Invoke-SecureDiskErase {
         & $reportStep 100 'Complete' 'Disk erase finished'
 
         $message = "Disk $DiskNumber ($diskModel, $diskSizeGB GB) erased successfully using $EraseMethod method ($mediaType/$protocol). Verified: $verified."
+        if ($EraseMethod -eq 'Quick') {
+            $message = "$message WARNING: Quick removed the partition table only. No data was overwritten and the contents remain recoverable. This is not a sanitization and carries no compliance claim."
+        }
         if ($reformatMessage) {
             $message = "$message $reformatMessage"
         }

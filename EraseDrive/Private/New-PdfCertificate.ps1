@@ -146,7 +146,11 @@ function New-PdfCertificate {
 
     # Header block
     & $addLine -Text 'CERTIFICATE OF DATA DESTRUCTION' -Font 'F2' -Size 18 -Align 'C' -Leading 22
-    & $addLine -Text 'NIST SP 800-88 Rev. 1 Compliant'  -Font 'F1' -Size 11 -Align 'C' -Leading 18
+    & $addLine -Text $(
+        if ($Method -match '^Quick') { 'NOT A SANITIZATION. NO COMPLIANCE CLAIM.' }
+        elseif ($null -ne $VerificationResult -and $VerificationResult.Verified) { 'NIST SP 800-88 Rev. 1 Compliant' }
+        else { 'NIST SP 800-88 Rev. 1 COMPLIANCE NOT ESTABLISHED' }
+    ) -Font 'F1' -Size 11 -Align 'C' -Leading 18
     & $addLine -Text ''
 
     # Identifiers
@@ -180,10 +184,18 @@ function New-PdfCertificate {
     & $addLine -Text 'ERASURE METHOD' -Font 'F2' -Size 11 -Leading 16
     & $addLine -Text ("Method:            {0}" -f $Method)            -Font 'F1' -Size 10
     & $addLine -Text ("Description:       {0}" -f $MethodDescription) -Font 'F1' -Size 10
-    $nistRef = if ($Method -match 'Secure') {
-        'NIST SP 800-88 Rev. 1, Section 2.4 (Clear); multi-pass overwrite for HDD'
+    # The reference must track what ran. A method that overwrites nothing gets no
+    # NIST reference at all, and an unverified overwrite does not assert Clear,
+    # because Rev.1 section 4.7 makes verification part of the standard.
+    $pdfVerified = ($null -ne $VerificationResult -and $VerificationResult.Verified)
+    $nistRef = if ($Method -match '^Quick') {
+        'NONE. Partition removal only; not a NIST SP 800-88 sanitization.'
+    } elseif (-not $pdfVerified) {
+        'NIST SP 800-88 Rev. 1 Section 2.4 (Clear) NOT ESTABLISHED: result unverified'
+    } elseif ($Method -match 'Secure') {
+        'NIST SP 800-88 Rev. 1, Section 2.4 (Clear); multi-pass overwrite, verified'
     } else {
-        'NIST SP 800-88 Rev. 1, Section 2.4 (Clear); single-pass remove'
+        'NIST SP 800-88 Rev. 1, Section 2.4 (Clear); single-pass overwrite, verified'
     }
     & $addLine -Text ("NIST Reference:    {0}" -f $nistRef) -Font 'F1' -Size 10
     & $addLine -Text ''

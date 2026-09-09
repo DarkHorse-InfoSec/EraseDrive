@@ -4,9 +4,18 @@ function Invoke-SecureOverwrite {
         Performs a real multi-pass secure overwrite on a drive or free space.
 
     .DESCRIPTION
-        Implements NIST 800-88 Clear method with a true multi-pass overwrite engine.
-        Pass 1 writes all zeros (0x00), Pass 2 writes all ones (0xFF), and Pass 3
-        writes cryptographically random data via RNGCryptoServiceProvider.
+        Implements NIST SP 800-88 Rev.1 Clear with a true multi-pass overwrite
+        engine. The default sequence is zeros (0x00), ones (0xFF), zeros (0x00).
+
+        The final pass deliberately writes a FIXED pattern rather than random data.
+        NIST SP 800-88 requires that sanitization be verified (Rev.1 section 4.7),
+        and sampling verification can only confirm a pattern it can predict; a
+        random final pass leaves a disk that is impossible to verify by sampling.
+        NIST also does not require multiple passes at all: Appendix A states that a
+        single overwrite pass with a fixed pattern hinders recovery even against
+        laboratory techniques, so ending on zeros costs no assurance and buys
+        verifiability. The zeros/ones/random sequence is DoD 5220.22-M legacy,
+        which NIST superseded.
 
         For drive-letter targets (e.g. "D:"), free space is filled by writing 512 MB
         temporary chunk files until the disk is full, then deleting them.
@@ -19,12 +28,16 @@ function Invoke-SecureOverwrite {
         (e.g. "\\.\PhysicalDrive1") for whole-disk overwrite.
 
     .PARAMETER Passes
-        Number of overwrite passes. Default is 3 (NIST 800-88 Clear).
+        Number of overwrite passes. Default is 3. One fixed-pattern pass already
+        satisfies NIST SP 800-88 Rev.1 Clear; more passes are offered because
+        procurement and audit checklists still ask for them.
 
     .PARAMETER PassPattern
         Optional array of custom hex-string patterns for each pass.
-        When supplied, overrides the default zero/one/random sequence.
-        Use "RANDOM" as a sentinel value for a cryptographic random pass.
+        When supplied, overrides the default sequence.
+        Use "RANDOM" as a sentinel value for a cryptographic random pass. A run
+        whose LAST pass is RANDOM reports FinalPattern as $null, because the
+        resulting disk cannot be verified by sampling.
 
     .PARAMETER ReportProgress
         Optional scriptblock callback invoked with a hashtable containing:
@@ -32,7 +45,16 @@ function Invoke-SecureOverwrite {
 
     .OUTPUTS
         PSCustomObject with properties: Success, BytesOverwritten, PassesCompleted,
-        Duration, Message.
+        Duration, Message, FinalPattern.
+
+        FinalPattern is the byte this run last wrote across the target, and is what
+        a subsequent verification must expect. It is $null when the disk was left
+        in a state sampling cannot predict: a RANDOM final pass, or a run where not
+        every pass completed and the media therefore holds a mix of patterns.
+
+        FinalPattern is deliberately a [byte] or $null and must be tested with
+        `$null -eq $result.FinalPattern`. A legitimate final pattern of 0x00 is the
+        common case and is falsy, so `if ($result.FinalPattern)` is always wrong.
     #>
     [CmdletBinding()]
     param(
@@ -67,12 +89,31 @@ function Invoke-SecureOverwrite {
         }
     }
     else {
-        # NIST 800-88 Clear defaults -- extend if more than 3 passes requested
-        $defaults = @('0x00', '0xFF', 'RANDOM')
+        # Default sequence. The LAST pass must be a fixed pattern so the result can
+        # be verified by sampling; see the .DESCRIPTION note on NIST 800-88 4.7.
+        $defaults = @('0x00', '0xFF', '0x00')
         for ($i = 0; $i -lt $Passes; $i++) {
             $patterns.Add($defaults[$i % $defaults.Count])
         }
+        # Cycling a 3-element list can land on 0xFF for some pass counts. Whatever
+        # the count, finish on zeros.
+        if ($Passes -gt 0) { $patterns[$Passes - 1] = '0x00' }
     }
+
+    # Resolve what the disk will be left holding, so the caller does not have to
+    # re-derive it. This value and the pattern a verifier expects are one fact; the
+    # whole point of returning it is that they stop being two.
+    $resolveFinalPattern = {
+        param([string]$Pattern)
+        if ($Pattern -eq 'RANDOM') { return $null }
+        if ($Pattern -match '^0x([0-9A-Fa-f]{1,2})$') {
+            return [byte][Convert]::ToInt32($Matches[1], 16)
+        }
+        # A repeating multi-byte sequence is not a single byte, so sampling against
+        # one byte cannot verify it.
+        return $null
+    }
+    $plannedFinalPattern = if ($Passes -gt 0) { & $resolveFinalPattern $patterns[$Passes - 1] } else { $null }
 
     Write-OperationLog -Message "Secure overwrite starting on '$TargetPath' -- $Passes pass(es) requested." -LogLevel 'Info'
 
@@ -105,6 +146,7 @@ function Invoke-SecureOverwrite {
                 PassesCompleted  = 0
                 Duration         = $stopwatch.Elapsed
                 Message          = $msg
+                FinalPattern     = $null
             }
         }
 
@@ -285,12 +327,19 @@ function Invoke-SecureOverwrite {
         $resultMsg = "Secure overwrite completed: $passesCompleted/$Passes passes, $totalBytesOverwritten bytes overwritten."
         Write-OperationLog -Message $resultMsg -LogLevel 'Info'
 
+        # Only claim a final pattern if every pass actually finished. A partial run
+        # leaves a mix of patterns on the media, which is exactly the state that must
+        # NOT be reported as verifiable.
+        $allPassesCompleted = ($passesCompleted -eq $Passes)
+        $finalPattern = if ($allPassesCompleted) { $plannedFinalPattern } else { $null }
+
         return [PSCustomObject]@{
-            Success          = ($passesCompleted -eq $Passes)
+            Success          = $allPassesCompleted
             BytesOverwritten = $totalBytesOverwritten
             PassesCompleted  = $passesCompleted
             Duration         = $stopwatch.Elapsed
             Message          = $resultMsg
+            FinalPattern     = $finalPattern
         }
     }
     catch {
@@ -305,6 +354,8 @@ function Invoke-SecureOverwrite {
             PassesCompleted  = $passesCompleted
             Duration         = $stopwatch.Elapsed
             Message          = $errMsg
+            # The run threw part way through, so the media holds an unknown mix.
+            FinalPattern     = $null
         }
     }
 }
