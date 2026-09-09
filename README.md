@@ -549,6 +549,38 @@ Logs are stored in `%ProgramData%\DarkHorse\EraseDrive\EraseDrive.log` with auto
 - Simple GUI interface
 - Administrator privilege checking
 
+## License
+
+EraseDrive is open source under the **Apache License, Version 2.0**. The full
+text is in [LICENSE](LICENSE); attribution and trademark terms are in
+[NOTICE](NOTICE).
+
+The word "license" does double duty in this project, so to be explicit about
+which is which:
+
+| | What it is | Terms |
+|---|---|---|
+| **The software** | Everything in this repository | Apache-2.0. Fork it, read it, run it, modify it, redistribute it. |
+| **An issued `.lic` file** | A signed credential tied to one purchase, unlocking the PDF Certificate of Destruction | Not open source and not redistributable. Yours to use, not to share. |
+| **The signing key** | The RSA private key behind every certificate | Not in this repository and never will be. |
+
+You can read every line before you let this near a disk, which for a tool whose
+entire job is irreversible destruction seems like the minimum.
+
+**On the paid tier and forks.** Nothing stops you removing the license check;
+it is a few lines of PowerShell and the Apache License permits it. Worth
+knowing what you get, though: the value of a Certificate of Destruction in an
+audit is not the PDF, it is that an identifiable party with a legal entity
+behind it attests to the erasure. A certificate a tool issued to itself is a
+document you wrote about yourself. If you need one that stands up to a third
+party, that is what the $99 buys.
+
+**Trademarks.** Apache-2.0 section 6 does not grant rights to the "EraseDrive"
+or "DarkHorse InfoSec" names. Derivative works are welcome, under a different
+name.
+
+---
+
 ## Legal Notice
 
 This tool is provided as-is for legitimate data destruction purposes. Users are responsible for:

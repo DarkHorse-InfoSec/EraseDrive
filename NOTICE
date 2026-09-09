@@ -1,0 +1,22 @@
+EraseDrive
+Copyright 2026 DarkHorse InfoSec
+
+This product includes software developed by DarkHorse InfoSec
+(https://github.com/HackingPain/EraseDrive).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full text.
+
+"EraseDrive" and "DarkHorse InfoSec" are names and marks of DarkHorse InfoSec.
+Section 6 of the Apache License, Version 2.0 does not grant permission to use
+them. Forks and derivative works are welcome under the terms of the License,
+but must not use these names in a way that suggests endorsement by, or origin
+from, DarkHorse InfoSec.
+
+Two things distributed alongside this software are NOT covered by the Apache
+License and are not open source:
+
+  1. An issued license file (*.lic). These are signed credentials tied to a
+     specific purchase, not software. They may not be redistributed or shared.
+  2. The RSA private key used to sign license files and Certificates of
+     Destruction. It is not part of this repository and never will be.
