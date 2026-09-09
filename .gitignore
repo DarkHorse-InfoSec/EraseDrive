@@ -18,3 +18,16 @@ Desktop.ini
 
 # Logs (generated at runtime)
 *.log
+
+# Secrets. The license signing private key lives in a password manager and is
+# never written inside this repository; these patterns are a second line of
+# defence, not the control.
+*.key
+*.pfx
+*.p12
+*.lic
+*private*.xml
+
+# Build output
+installer/Output/
+*.exe
