@@ -185,6 +185,12 @@ Run headless for automation, scripting, and MDT/SCCM task sequences.
 
 ### Device Reissue Wipe
 
+> **Not available in v3.1.0.** The reissue wipe and the WinPE boot-media builder
+> ship in this release but are deliberately **not exported**, because neither has
+> been executed against a real machine yet. They become public API in v3.2 once
+> the offline wipe is proven end to end. Documented here so the design is
+> reviewable; the commands below will not resolve in v3.1.0.
+
 ```powershell
 # Offline, from the WinPE boot stick. The complete wipe.
 .\Start-EraseDrive.ps1 -Mode CLI -Operation ReissueWipe -OfflineRoot C:\ -RemoveFromDomain -Method Secure -Force

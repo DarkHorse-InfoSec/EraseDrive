@@ -17,10 +17,8 @@
     )
 
     FunctionsToExport = @(
-        'Invoke-DeviceReissueWipe',
         'Invoke-ForensicUserDataWipe',
         'Invoke-SecureDiskErase',
-        'New-EraseDriveBootMedia',
         'Start-EraseDriveGUI'
     )
 

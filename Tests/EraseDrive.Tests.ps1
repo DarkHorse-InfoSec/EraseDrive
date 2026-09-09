@@ -93,12 +93,15 @@ Describe 'Module Structure' {
     }
 
     It 'Exports exactly the expected public functions in the manifest' {
-        $manifest.ExportedFunctions.Keys | Should -HaveCount 5
+        # Deliberately 3, not 5. Invoke-DeviceReissueWipe and New-EraseDriveBootMedia
+        # ship in v3.1.0 but are NOT exported, because neither has ever been executed.
+        # They become public API in v3.2 once the VM and WinPE runs pass.
+        $manifest.ExportedFunctions.Keys | Should -HaveCount 3
         $manifest.ExportedFunctions.Keys | Should -Contain 'Invoke-ForensicUserDataWipe'
         $manifest.ExportedFunctions.Keys | Should -Contain 'Invoke-SecureDiskErase'
         $manifest.ExportedFunctions.Keys | Should -Contain 'Start-EraseDriveGUI'
-        $manifest.ExportedFunctions.Keys | Should -Contain 'Invoke-DeviceReissueWipe'
-        $manifest.ExportedFunctions.Keys | Should -Contain 'New-EraseDriveBootMedia'
+        $manifest.ExportedFunctions.Keys | Should -Not -Contain 'Invoke-DeviceReissueWipe'
+        $manifest.ExportedFunctions.Keys | Should -Not -Contain 'New-EraseDriveBootMedia'
     }
 }
 

@@ -228,6 +228,19 @@ function Start-EraseDriveGUI {
     $lblTier.Location  = New-Object System.Drawing.Point(900, 48)
     $headerPanel.Controls.Add($lblTier)
 
+    # The hardcoded X above placed the badge past the right edge of the header on
+    # a narrower form and at non-100% DPI, so the tier was never visible even with
+    # a valid Pro license loaded. Position it from the panel's real width instead,
+    # and reposition whenever the panel resizes or the text changes width.
+    $positionTierBadge = {
+        if ($headerPanel.ClientSize.Width -gt 0) {
+            $x = $headerPanel.ClientSize.Width - $lblTier.PreferredWidth - 24
+            if ($x -lt 0) { $x = 0 }
+            $lblTier.Location = New-Object System.Drawing.Point([int]$x, 48)
+        }
+    }
+    $headerPanel.Add_Resize({ & $positionTierBadge })
+
     # Helper to refresh the tier badge from the active license
     $script:currentLicense = $null
     $refreshTierBadge = {
@@ -246,6 +259,7 @@ function Start-EraseDriveGUI {
             'MSP'  { $lblTier.ForeColor = [System.Drawing.Color]::FromArgb(190, 130, 230) }
             default { $lblTier.ForeColor = $cDimText }
         }
+        & $positionTierBadge
     }
 
     $form.Controls.Add($headerPanel)
@@ -283,6 +297,14 @@ function Start-EraseDriveGUI {
 
     # DataTable schema
     $diskTable = New-Object System.Data.DataTable
+
+    # An explicit tick, not just a highlighted row. Selecting the wrong disk is the
+    # one unrecoverable mistake this tool can make, and row highlight is easy to
+    # misread on a dark theme or to leave stale after a refresh. The erase handler
+    # reads THIS column, never the highlight.
+    $selectCol = $diskTable.Columns.Add('SELECT', [bool])
+    $selectCol.DefaultValue = $false
+
     @('Number', 'FriendlyName', 'SerialNumber', 'MediaType', 'BusType',
       'OperationalStatus', 'HealthStatus', 'Size (GB)', 'Partitions', 'Safety Status') | ForEach-Object {
         $diskTable.Columns.Add($_, [string]) | Out-Null
@@ -292,7 +314,7 @@ function Start-EraseDriveGUI {
     $dgv = New-Object System.Windows.Forms.DataGridView
     $dgv.Dock                    = 'Fill'
     $dgv.DataSource              = $diskTable
-    $dgv.ReadOnly                = $true
+    $dgv.ReadOnly                = $false   # per-column below; only SELECT is editable
     $dgv.AllowUserToAddRows      = $false
     $dgv.AllowUserToDeleteRows   = $false
     $dgv.AllowUserToResizeRows   = $false
@@ -314,6 +336,58 @@ function Start-EraseDriveGUI {
     $dgv.ColumnHeadersDefaultCellStyle.Font      = $fontButton
     $dgv.EnableHeadersVisualStyles = $false
     $dgv.ColumnHeadersBorderStyle  = 'Single'
+
+    # Only SELECT is editable, and it is pinned to the far left at a fixed width.
+    # Re-applied on every binding because rebinding regenerates the columns.
+    $dgv.Add_DataBindingComplete({
+        param($sender, $e)
+        foreach ($c in $sender.Columns) {
+            $c.ReadOnly = ($c.Name -ne 'SELECT')
+        }
+        $sel = $sender.Columns['SELECT']
+        if ($null -ne $sel) {
+            $sel.HeaderText   = 'SELECT'
+            $sel.AutoSizeMode = 'None'
+            $sel.Width        = 70
+            $sel.DisplayIndex = 0
+        }
+    })
+
+    # Without committing the edit immediately, CellValueChanged does not fire until
+    # focus leaves the cell, so the tick would look set while the value was still
+    # unchanged underneath.
+    $dgv.Add_CurrentCellDirtyStateChanged({
+        param($sender, $e)
+        if ($sender.IsCurrentCellDirty) {
+            $sender.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+        }
+    })
+
+    # Exactly one disk may be ticked. Re-entrancy guard because clearing the other
+    # rows raises CellValueChanged again.
+    $script:suppressCheckSync = $false
+    $dgv.Add_CellValueChanged({
+        param($sender, $e)
+        if ($e.RowIndex -lt 0) { return }
+        $col = $sender.Columns[$e.ColumnIndex]
+        if ($null -eq $col -or $col.Name -ne 'SELECT') { return }
+        if ($script:suppressCheckSync) { return }
+
+        $script:suppressCheckSync = $true
+        try {
+            if ([bool]$sender.Rows[$e.RowIndex].Cells[$e.ColumnIndex].Value) {
+                foreach ($r in $sender.Rows) {
+                    if ($r.Index -ne $e.RowIndex) {
+                        $r.Cells[$e.ColumnIndex].Value = $false
+                    }
+                }
+                $sender.Rows[$e.RowIndex].Selected = $true
+            }
+        }
+        finally {
+            $script:suppressCheckSync = $false
+        }
+    })
 
     # Color-code rows based on Safety Status
     $dgv.Add_CellFormatting({
@@ -764,11 +838,24 @@ function Start-EraseDriveGUI {
 
     # ── ERASE DISK ────────────────────────────────────────────────────────────
     $btnEraseDisk.Add_Click({
-        # Require a disk selection
-        if ($dgv.SelectedRows.Count -eq 0) {
+        # Act on the ticked row, NOT the highlighted one. A highlight can be left
+        # over from a refresh or moved by an arrow key; a tick is deliberate.
+        $checkedRows = @($dgv.Rows | Where-Object {
+            $null -ne $_.Cells['SELECT'].Value -and [bool]$_.Cells['SELECT'].Value
+        })
+
+        if ($checkedRows.Count -eq 0) {
             [System.Windows.Forms.MessageBox]::Show(
-                'Please select a disk from the list first.',
+                'Tick the SELECT box next to the disk you want to erase.',
                 'No Disk Selected', 'OK', 'Warning'
+            )
+            return
+        }
+
+        if ($checkedRows.Count -gt 1) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "$($checkedRows.Count) disks are ticked. Tick exactly one.",
+                'Multiple Disks Selected', 'OK', 'Warning'
             )
             return
         }
@@ -782,7 +869,7 @@ function Start-EraseDriveGUI {
             return
         }
 
-        $selectedRow  = $dgv.SelectedRows[0]
+        $selectedRow  = $checkedRows[0]
         $diskNum      = [int]$selectedRow.Cells['Number'].Value
         $diskName     = $selectedRow.Cells['FriendlyName'].Value
         $diskSerial   = $selectedRow.Cells['SerialNumber'].Value
