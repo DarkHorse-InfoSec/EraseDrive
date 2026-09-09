@@ -1,5 +1,22 @@
 # EraseDrive installer
 
+> **PARKED as of 2026-09-09. This installer is not shipped in v3.1.0.**
+>
+> No Authenticode certificate was purchased: roughly $300/yr against a project
+> with zero revenue is not justified, and an unsigned `.exe` that destroys disks
+> has the exact profile of malware. Asking sysadmins to click through "Windows
+> protected your PC" to run a wiper trains the wrong instinct in precisely the
+> audience whose trust the product needs. Signed installer or no installer.
+>
+> **v3.1.0 ships module-only: a ZIP plus a GitHub release.** A ZIP of `.ps1`
+> files carries Mark-of-the-Web instead of a SmartScreen block, which
+> `Unblock-File` clears and the top-level README documents.
+>
+> Everything below still works and is kept intact. It comes back in v3.2 if
+> SignPath.io accepts the project for free open-source signing, or if revenue
+> later justifies a paid certificate. Nothing here has ever been executed: the
+> installer has never been built.
+
 Inno Setup script + PowerShell build wrapper for producing the distributable, code-signable `EraseDrive-Setup-3.1.0.exe`.
 
 ## Prerequisites
@@ -7,7 +24,7 @@ Inno Setup script + PowerShell build wrapper for producing the distributable, co
 - Windows 10 / 11 (64-bit) build machine.
 - [Inno Setup 6](https://jrsoftware.org/isdl.php) installed in the default location (`C:\Program Files (x86)\Inno Setup 6`).
 - Windows 10/11 SDK installed (for `signtool.exe`) when code-signing.
-- For signing: a Sectigo OV Authenticode `.pfx` file. The location is passed via `-PfxPath` or the `ERASEDRIVE_SIGNING_PFX` env var.
+- For signing: any Authenticode `.pfx`, passed via `-PfxPath` or the `ERASEDRIVE_SIGNING_PFX` env var. No certificate has been obtained; see the note at the top.
 
 ## Build (unsigned, for local smoke testing)
 
