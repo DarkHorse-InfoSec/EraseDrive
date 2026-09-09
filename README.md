@@ -216,7 +216,40 @@ Exit codes: `0` wipe complete, `2` succeeded but remnants remain (see the printe
 
 # Quick erase, skip verification
 .\Start-EraseDrive.ps1 -Mode CLI -Operation DiskErase -DiskNumber 1 -Method Standard -SkipVerification -Force
+
+# Erase, then bring the disk back as a usable NTFS volume instead of leaving it raw
+.\Start-EraseDrive.ps1 -Mode CLI -Operation DiskErase -DiskNumber 2 -Method Secure -Force -Reformat
+
+# Same, as exFAT for a removable stick that has to work outside Windows
+.\Start-EraseDrive.ps1 -Mode CLI -Operation DiskErase -DiskNumber 2 -Method Secure -Force `
+    -Reformat -ReformatFileSystem exFAT -ReformatLabel RECOVERED
 ```
+
+### After an erase, the disk is RAW. That is normal.
+
+Erasing removes the partition table along with the data, so a successfully erased
+disk has no filesystem and no drive letter, and will not appear in File Explorer.
+It is not damaged. This is the correct end state for a destruction tool: the
+default leaves nothing behind to be recovered from.
+
+To get a usable disk back, either:
+
+- pass `-Reformat` (CLI) or tick **Reformat disk after erase** (GUI), or
+- open Disk Management (`diskmgmt.msc`), right-click the disk, choose
+  **Initialize Disk**, then create a **New Simple Volume**.
+
+`-Reformat` is off by default and is deliberately gated. It runs only after the
+erase *and* its verification have both succeeded, so a filesystem is never written
+over a disk EraseDrive has not confirmed to be clean; doing that would bury any
+residual data under a fresh directory structure and make a later audit harder. It
+is skipped, with the reason reported in `ReformatMessage`, when `-SkipVerification`
+was used, when verification did not pass, or when the requested filesystem cannot
+address the disk (FAT32 above 32 GB, MBR above 2 TB).
+
+A failed reformat never fails the erase. The data is destroyed and the certificate
+is valid either way; the disk is simply still raw. When a reformat does happen, the
+erasure certificate records it, so an auditor who finds a live filesystem on a
+"destroyed" disk can see that EraseDrive put it there and when.
 
 ### Using the Module Directly
 
@@ -230,6 +263,12 @@ $result | Format-List
 # Complete disk erasure
 $result = Invoke-SecureDiskErase -DiskNumber 2 -EraseMethod Secure
 $result | Format-List
+
+# Erase, verify, then reformat so the disk is usable again
+$result = Invoke-SecureDiskErase -DiskNumber 2 -EraseMethod Secure -Reformat
+$result.Reformatted      # $true if a filesystem was created
+$result.DriveLetter      # the letter it was mounted as
+$result.ReformatMessage  # what happened, or why it was skipped
 
 # Check if a disk is safe (private function; use InModuleScope or call via module)
 ```

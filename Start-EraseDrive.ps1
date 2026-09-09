@@ -36,6 +36,18 @@
 .PARAMETER SkipVerification
     Skip the post-erase verification pass. Not recommended.
 
+.PARAMETER Reformat
+    CLI mode, DiskErase only. After a successful and verified erase, create a single
+    full-size partition and filesystem so the disk is usable again instead of being
+    left raw. Off by default. Ignored, with a reason logged, if -SkipVerification was
+    passed or verification did not pass.
+
+.PARAMETER ReformatFileSystem
+    Filesystem created by -Reformat: 'NTFS' (default), 'exFAT', or 'FAT32'.
+
+.PARAMETER ReformatLabel
+    Volume label applied by -Reformat. Default: 'ERASED'.
+
 .PARAMETER TimeoutMinutes
     Maximum number of minutes the operation is allowed to run. 0 (default) means no
     timeout. Passed through to Invoke-SecureDiskErase in CLI mode.
@@ -117,6 +129,15 @@ param(
     [switch]$ClearEventLogs,
 
     [switch]$SkipVerification,
+
+    [switch]$Reformat,
+
+    [ValidateSet('NTFS', 'exFAT', 'FAT32')]
+    [string]$ReformatFileSystem = 'NTFS',
+
+    [ValidateNotNullOrEmpty()]
+    [ValidateLength(1, 32)]
+    [string]$ReformatLabel = 'ERASED',
 
     [int]$TimeoutMinutes = 0,
 
@@ -258,11 +279,34 @@ else {
                 Write-Host "`n=== COMPLETE DISK ERASURE ===" -ForegroundColor Red
                 Write-Host "Target: $diskDesc" -ForegroundColor Yellow
                 Write-Host "Method: $Method" -ForegroundColor Yellow
+                if ($Reformat) {
+                    Write-Host "After:  reformat as $ReformatFileSystem once the erase is verified" -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host "After:  leave the disk raw (no partitions, no drive letter)" -ForegroundColor Yellow
+                }
                 Write-Host ""
 
-                $result = Invoke-SecureDiskErase -DiskNumber $DiskNumber -EraseMethod $Method -SkipVerification:$SkipVerification -TimeoutMinutes $TimeoutMinutes
+                $result = Invoke-SecureDiskErase -DiskNumber $DiskNumber -EraseMethod $Method -SkipVerification:$SkipVerification -TimeoutMinutes $TimeoutMinutes -Reformat:$Reformat -ReformatFileSystem $ReformatFileSystem -ReformatLabel $ReformatLabel
                 if ($result.Success) {
                     Write-Host "`nErase completed successfully." -ForegroundColor Green
+                    if ($result.PSObject.Properties['Reformatted'] -and $result.Reformatted) {
+                        $letter = $result.DriveLetter
+                        if ($letter) {
+                            Write-Host "Disk reformatted and mounted as drive ${letter}:" -ForegroundColor Green
+                        }
+                        else {
+                            Write-Host "Disk reformatted. No drive letter was assigned; assign one in Disk Management." -ForegroundColor Yellow
+                        }
+                    }
+                    else {
+                        Write-Host "The disk is now RAW: no partition table, no drive letter. That is the normal" -ForegroundColor Yellow
+                        Write-Host "result of an erase, not damage. Re-run with -Reformat, or use Disk Management," -ForegroundColor Yellow
+                        Write-Host "to make it usable again." -ForegroundColor Yellow
+                        if ($result.PSObject.Properties['ReformatMessage'] -and $result.ReformatMessage) {
+                            Write-Host $result.ReformatMessage -ForegroundColor Yellow
+                        }
+                    }
                     $logPath = Join-Path $env:ProgramData 'DarkHorse\EraseDrive\EraseDrive.log'
                     Write-Host "Log: $logPath" -ForegroundColor Cyan
                     if ($result.CertificatePath) {

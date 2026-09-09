@@ -574,9 +574,20 @@ function Start-EraseDriveGUI {
     $chkClearLogs.Checked   = $false
     $chkClearLogs.Font      = $fontNormal
 
+    # Off by default. An erase leaves the disk raw, which is the correct end state
+    # for a destruction tool; reformatting is the operator opting back into a
+    # usable disk, and it only runs after the erase has been verified.
+    $chkReformat = New-Object System.Windows.Forms.CheckBox
+    $chkReformat.Text      = 'Reformat disk after erase (NTFS)'
+    $chkReformat.Location  = New-Object System.Drawing.Point(390, 58)
+    $chkReformat.AutoSize  = $true
+    $chkReformat.ForeColor = $cGray
+    $chkReformat.Checked   = $false
+    $chkReformat.Font      = $fontNormal
+
     $controlPanel.Controls.AddRange(@(
         $btnUserWipe, $btnEraseDisk, $btnRefresh, $btnCancel, $btnLoadLicense, $btnExit,
-        $lblMethod, $cmbMethod, $chkBackup, $chkClearLogs
+        $lblMethod, $cmbMethod, $chkBackup, $chkClearLogs, $chkReformat
     ))
     $form.Controls.Add($controlPanel)
 
@@ -618,6 +629,7 @@ function Start-EraseDriveGUI {
         $cmbMethod.Enabled       = $false
         $chkBackup.Enabled       = $false
         $chkClearLogs.Enabled    = $false
+        $chkReformat.Enabled     = $false
         $btnCancel.Visible       = $true
         $progressBar.Visible     = $true
         $progressBar.Value       = 0
@@ -639,6 +651,7 @@ function Start-EraseDriveGUI {
         $cmbMethod.Enabled       = $true
         $chkBackup.Enabled       = $true
         $chkClearLogs.Enabled    = $true
+        $chkReformat.Enabled     = $true
         $btnCancel.Visible       = $false
         $progressBar.Visible     = $false
         $progressBar.Style       = 'Blocks'
@@ -747,6 +760,37 @@ function Start-EraseDriveGUI {
                 }
                 if ($result.PSObject.Properties['Verified']) {
                     $msg += "`nVerified: $($result.Verified)"
+                }
+
+                # Disk erase results carry DiskNumber; user-data wipe results do not.
+                # An erased disk has no partition table and so no drive letter, which
+                # reads as a bricked disk to anyone who does not know that is the point.
+                if ($result.PSObject.Properties['DiskNumber']) {
+                    $didReformat = $result.PSObject.Properties['Reformatted'] -and $result.Reformatted
+                    $reformatNote = if ($result.PSObject.Properties['ReformatMessage']) { $result.ReformatMessage } else { $null }
+
+                    if ($didReformat) {
+                        $letter = if ($result.PSObject.Properties['DriveLetter']) { $result.DriveLetter } else { $null }
+                        $msg += if ($letter) {
+                            "`n`nThe disk was reformatted and is ready to use as drive ${letter}:."
+                        }
+                        else {
+                            "`n`nThe disk was reformatted. Windows did not assign a drive letter; assign one in Disk Management (diskmgmt.msc)."
+                        }
+                    }
+                    else {
+                        $msg += "`n`nTHE DISK IS NOW RAW, AND THAT IS NORMAL." +
+                                "`nErasing removes the partition table along with the data, so the disk" +
+                                "`nhas no drive letter and will not appear in File Explorer. It is not" +
+                                "`ndamaged and it has not been lost."
+                        if ($reformatNote) {
+                            $msg += "`n`n$reformatNote"
+                        }
+                        $msg += "`n`nTo make it usable again, either:" +
+                                "`n  - re-run the erase with 'Reformat disk after erase' ticked, or" +
+                                "`n  - open Disk Management (diskmgmt.msc), right-click the disk," +
+                                "`n    choose Initialize Disk, then New Simple Volume."
+                    }
                 }
 
                 # Free-tier upgrade nudge
@@ -897,7 +941,15 @@ function Start-EraseDriveGUI {
             return
         }
 
-        $method = $cmbMethod.SelectedItem.ToString()
+        $method   = $cmbMethod.SelectedItem.ToString()
+        $reformat = $chkReformat.Checked
+
+        $afterText = if ($reformat) {
+            'Reformat as NTFS after the erase is verified'
+        }
+        else {
+            'Leave the disk raw (no drive letter)'
+        }
 
         # First confirmation
         $confirm = [System.Windows.Forms.MessageBox]::Show(
@@ -905,7 +957,8 @@ function Start-EraseDriveGUI {
             "  Disk:   $diskName`n" +
             "  Serial: $diskSerial`n" +
             "  Size:   $sizeGB GB`n" +
-            "  Method: $method`n`n" +
+            "  Method: $method`n" +
+            "  After:  $afterText`n`n" +
             "ALL DATA ON THIS DISK WILL BE PERMANENTLY DESTROYED.`n" +
             "This action is IRREVERSIBLE. Continue?",
             'Confirm Disk Erasure', 'YesNo', 'Warning'
@@ -927,15 +980,15 @@ function Start-EraseDriveGUI {
             return
         }
 
-        Write-OperationLog -Message "GUI: Starting disk erase - Disk #$diskNum ($diskName), Method: $method" -LogLevel 'INFO'
+        Write-OperationLog -Message "GUI: Starting disk erase - Disk #$diskNum ($diskName), Method: $method, Reformat: $reformat" -LogLevel 'INFO'
         & $setRunningState 'Disk Erase'
 
         $script:ps = [PowerShell]::Create()
         $script:ps.AddScript({
-            param($modPath, $dNum, $eraseMethod)
+            param($modPath, $dNum, $eraseMethod, $doReformat)
             Import-Module $modPath -Force
-            Invoke-SecureDiskErase -DiskNumber $dNum -EraseMethod $eraseMethod -Confirm:$false
-        }).AddArgument($modulePath).AddArgument($diskNum).AddArgument($method) | Out-Null
+            Invoke-SecureDiskErase -DiskNumber $dNum -EraseMethod $eraseMethod -Reformat:$doReformat -Confirm:$false
+        }).AddArgument($modulePath).AddArgument($diskNum).AddArgument($method).AddArgument($reformat) | Out-Null
 
         $script:asyncResult = $script:ps.BeginInvoke()
         $pollTimer.Start()
