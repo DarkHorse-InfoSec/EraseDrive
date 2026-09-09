@@ -87,12 +87,13 @@ BeforeAll {
     }
 }
 
-# Each test starts with no license; opt in via Set-TestLicense.
-BeforeEach {
-    Remove-TestLicense
-}
 
 Describe 'New-PdfCertificate - PDF structure' {
+
+    # Each test starts with no license; opt in via Set-TestLicense.
+    BeforeEach {
+        Remove-TestLicense
+    }
 
     It 'Writes a file that starts with %PDF-1.4 and ends with %%EOF' {
         $pdfPath = Join-Path $TestDrive 'structure.pdf'
@@ -202,6 +203,11 @@ Describe 'New-PdfCertificate - PDF structure' {
 }
 
 Describe 'New-ErasureCertificate - license gating' {
+
+    # Each test starts with no license; opt in via Set-TestLicense.
+    BeforeEach {
+        Remove-TestLicense
+    }
 
     It 'Free tier: writes .txt only, no .pdf' {
         # Ensure no license file exists

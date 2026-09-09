@@ -93,10 +93,12 @@ Describe 'Module Structure' {
     }
 
     It 'Exports exactly the expected public functions in the manifest' {
-        $manifest.ExportedFunctions.Keys | Should -HaveCount 3
+        $manifest.ExportedFunctions.Keys | Should -HaveCount 5
         $manifest.ExportedFunctions.Keys | Should -Contain 'Invoke-ForensicUserDataWipe'
         $manifest.ExportedFunctions.Keys | Should -Contain 'Invoke-SecureDiskErase'
         $manifest.ExportedFunctions.Keys | Should -Contain 'Start-EraseDriveGUI'
+        $manifest.ExportedFunctions.Keys | Should -Contain 'Invoke-DeviceReissueWipe'
+        $manifest.ExportedFunctions.Keys | Should -Contain 'New-EraseDriveBootMedia'
     }
 }
 
@@ -318,7 +320,7 @@ Describe 'Get-DiskMediaType' {
     }
 
     It 'Returns MediaType=SSD and Protocol=NVMe for an NVMe SSD' {
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '0'; MediaType = 'SSD'; BusType = 'NVMe' })
         }
 
@@ -330,7 +332,7 @@ Describe 'Get-DiskMediaType' {
     }
 
     It 'Returns MediaType=HDD and Protocol=SATA for a SATA HDD' {
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '1'; MediaType = 'HDD'; BusType = 'SATA' })
         }
 
@@ -342,7 +344,7 @@ Describe 'Get-DiskMediaType' {
     }
 
     It 'Returns MediaType=Unknown for Unspecified media' {
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '2'; MediaType = 'Unspecified'; BusType = 'USB' })
         }
 
@@ -353,7 +355,7 @@ Describe 'Get-DiskMediaType' {
     }
 
     It 'Returns defaults gracefully when Get-PhysicalDisk throws' {
-        Mock Get-PhysicalDisk { throw 'Access denied' }
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' { throw 'Access denied' }
 
         $result = Get-DiskMediaType -DiskNumber 99
 
@@ -364,7 +366,7 @@ Describe 'Get-DiskMediaType' {
     }
 
     It 'Detects SupportsSecureErase=$true for a SATA SSD' {
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '3'; MediaType = 'SSD'; BusType = 'SATA' })
         }
 
@@ -376,7 +378,7 @@ Describe 'Get-DiskMediaType' {
     }
 
     It 'Maps ATA BusType to SATA protocol' {
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '4'; MediaType = 'HDD'; BusType = 'ATA' })
         }
 
@@ -682,7 +684,7 @@ Describe 'Invoke-SecureDiskErase' {
             }
         }
 
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{
                 DeviceId     = '1'
                 SerialNumber = 'TESTSERIAL'
@@ -1126,7 +1128,7 @@ Describe 'Test-DiskSafeToErase - Round 2 Safety Checks' {
             $Path -match ':\\Windows$' -or $Path -match ':\\Program Files$'
         }
         Mock Get-VirtualDisk { return @() }
-        Mock Get-PhysicalDisk { return @() }
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' { return @() }
     }
 
     It 'Returns Safe=$false when disk OperationalStatus is Offline' {
@@ -1163,7 +1165,7 @@ Describe 'Test-DiskSafeToErase - Round 2 Safety Checks' {
         Mock Get-VirtualDisk {
             @([PSCustomObject]@{ FriendlyName = 'StoragePool1' })
         }
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '3'; BusType = 'SATA' })
         } -ParameterFilter { $VirtualDisk -ne $null }
 
@@ -1185,7 +1187,7 @@ Describe 'Test-DiskSafeToErase - Round 2 Safety Checks' {
             }
         }
         Mock Get-VirtualDisk { return @() }
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '4'; BusType = 'Virtual' })
         }
 
@@ -1258,7 +1260,7 @@ Describe 'Invoke-SecureDiskErase - Round 2 Features' {
         }
 
         # Default: serial stays consistent across calls
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{
                 DeviceId     = '1'
                 SerialNumber = 'SERIAL_CONSISTENT'
@@ -1361,7 +1363,7 @@ Describe 'Invoke-SecureDiskErase - Round 2 Features' {
         # We need Get-PhysicalDisk to return different serials on successive calls.
 
         $script:serialCallCount = 0
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             $script:serialCallCount++
             if ($script:serialCallCount -le 2) {
                 # First two calls: pinning + disk info gathering
