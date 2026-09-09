@@ -31,3 +31,9 @@ Desktop.ini
 # Build output
 installer/Output/
 *.exe
+
+# Evidence root. Set-EraseDriveEvidenceRoot prefers the directory the module was
+# launched from, which in a source checkout is this repository. Certificates and
+# audit logs must never be committed.
+EraseDrive-Evidence/
+dist/
