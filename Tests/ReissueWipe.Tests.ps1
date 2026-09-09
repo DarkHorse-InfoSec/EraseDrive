@@ -495,12 +495,19 @@ Describe 'Invoke-Generalize preflight' {
 # ============================================================================
 Describe 'Manifest' {
 
-    It 'exports <Function>' -ForEach @(
+    It 'ships <Function> as a file but does NOT export it in v3.1.0' -ForEach @(
         @{ Function = 'Invoke-DeviceReissueWipe' }
         @{ Function = 'New-EraseDriveBootMedia' }
     ) {
-        $manifest = Import-PowerShellDataFile -Path (Join-Path (Join-Path (Join-Path $PSScriptRoot '..') 'EraseDrive') 'EraseDrive.psd1')
-        $manifest.FunctionsToExport | Should -Contain $Function
+        # Both ship dormant. Neither has ever been executed against a real machine,
+        # so neither is public API yet; they are exported in v3.2 once the VM and
+        # WinPE runs pass. Asserting BOTH halves matters: the file must still ship,
+        # and the manifest must not advertise it.
+        $moduleDir = Join-Path (Join-Path $PSScriptRoot '..') 'EraseDrive'
+        $manifest  = Import-PowerShellDataFile -Path (Join-Path $moduleDir 'EraseDrive.psd1')
+
+        Test-Path (Join-Path (Join-Path $moduleDir 'Public') "$Function.ps1") | Should -BeTrue
+        $manifest.FunctionsToExport | Should -Not -Contain $Function
     }
 
     It 'declares every exported function as a real file' {
