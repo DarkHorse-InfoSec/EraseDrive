@@ -641,7 +641,13 @@ Describe 'Invoke-ForensicUserDataWipe' {
 
         { Invoke-ForensicUserDataWipe -WipeMethod Standard -WhatIf } | Should -Not -Throw
 
-        Should -Invoke Remove-Item -Times 0 -Scope It
+        # The evidence-root writability probe deliberately creates and deletes its
+        # own file with -WhatIf:$false, so a dry run reports the truth about the
+        # audit-trail location. Exclude only that path; every other delete must
+        # still be suppressed.
+        Should -Invoke Remove-Item -Times 0 -Scope It -ParameterFilter {
+            $LiteralPath -notlike '*.ed_write_probe_*'
+        }
         Should -Invoke Stop-Process -Times 0 -Scope It
         Should -Invoke Stop-Service -Times 0 -Scope It
         Should -Invoke Start-Process -Times 0 -Scope It
@@ -772,10 +778,13 @@ Describe 'Invoke-SecureDiskErase' {
         Should -Invoke Test-EraseVerification -Times 0 -Scope It
     }
 
-    It 'Does NOT call Test-EraseVerification for Standard erase method' {
+    It 'Calls Test-EraseVerification for Standard erase unless -SkipVerification' {
+        # Verification is gated on -SkipVerification alone, not on EraseMethod, which
+        # is what the comment-based help has always documented. This test previously
+        # asserted the opposite and had never run on PowerShell 5.1 to catch it.
         $null = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Confirm:$false
 
-        Should -Invoke Test-EraseVerification -Times 0 -Scope It
+        Should -Invoke Test-EraseVerification -Times 1 -Scope It
     }
 
     It 'Calls New-ErasureCertificate on successful erase' {
@@ -873,14 +882,39 @@ Describe 'Enter-OperationLock and Exit-OperationLock' {
     }
 
     It 'Returns Acquired=$false with a Message when another lock is already held' {
+        # A named mutex is REENTRANT for the thread that owns it, so acquiring twice
+        # on this thread returns $true both times and proves nothing. The guard
+        # exists to stop a second EraseDrive PROCESS, so contend from one. This test
+        # asserted same-thread reentrancy until 2026-09-09 and had never run.
         $firstLock = Enter-OperationLock -OperationName 'FirstOp'
 
         try {
             $firstLock.Acquired | Should -BeTrue
 
-            $secondLock = Enter-OperationLock -OperationName 'SecondOp'
+            $privateDir = Join-Path (Join-Path $PSScriptRoot '..') 'EraseDrive\Private'
+            $job = Start-Job -ScriptBlock {
+                param($dir)
+                $Script:EraseDriveConfig = @{
+                    LogDirectory = $env:TEMP
+                    LogFile      = Join-Path $env:TEMP 'EraseDrive-locktest.log'
+                    MaxLogSizeMB = 1
+                    MaxLogFiles  = 1
+                }
+                Get-ChildItem $dir -Filter '*.ps1' | ForEach-Object { . $_.FullName }
+                Enter-OperationLock -OperationName 'SecondOp'
+            } -ArgumentList $privateDir
+
+            $secondLock = $job | Wait-Job -Timeout 60 | Receive-Job
+            Remove-Job $job -Force -ErrorAction SilentlyContinue
+
+            $secondLock | Should -Not -BeNullOrEmpty
             $secondLock.Acquired | Should -BeFalse
             $secondLock.Message | Should -Not -BeNullOrEmpty
+
+            # Assert the REASON, not just the refusal. Without this a failure to load
+            # the module in the job would land in the catch block and return
+            # Acquired=$false for an entirely unrelated reason, passing this test
+            # while proving the opposite of what it claims.
             $secondLock.Message | Should -BeLike '*already running*'
         }
         finally {

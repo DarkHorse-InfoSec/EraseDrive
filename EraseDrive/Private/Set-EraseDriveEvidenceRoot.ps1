@@ -68,14 +68,21 @@ function Set-EraseDriveEvidenceRoot {
     $testWritable = {
         param([string]$Candidate)
 
+        # -WhatIf:$false on all three is deliberate. Securing the audit trail is a
+        # preflight check, not the operation being previewed, and without it a dry
+        # run inherits $WhatIfPreference, every cmdlet below no-ops, and this
+        # returns $true having proved nothing. That is the exact failure D2 exists
+        # to surface: the operator would be told a read-only, full or physically
+        # write-locked location was usable. The probe file is created and removed
+        # by this function and nothing else is touched.
         try {
             if (-not (Test-Path -LiteralPath $Candidate)) {
-                New-Item -Path $Candidate -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                New-Item -Path $Candidate -ItemType Directory -Force -ErrorAction Stop -WhatIf:$false | Out-Null
             }
 
             $probe = Join-Path $Candidate ('.ed_write_probe_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-            Set-Content -LiteralPath $probe -Value 'probe' -ErrorAction Stop
-            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+            Set-Content -LiteralPath $probe -Value 'probe' -ErrorAction Stop -WhatIf:$false
+            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue -WhatIf:$false
             return $true
         }
         catch {
