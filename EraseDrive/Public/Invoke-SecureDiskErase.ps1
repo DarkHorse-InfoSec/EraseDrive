@@ -105,6 +105,8 @@ function Invoke-SecureDiskErase {
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $verified = $false
     $certificatePath = $null
+    $pdfCertificatePath = $null
+    $licenseTier = 'Free'
     $operationLock = $null
 
     # Helper to invoke progress callback safely
@@ -150,7 +152,12 @@ function Invoke-SecureDiskErase {
 
             if ($partialCertResult.Success) {
                 $script:certificatePath = $partialCertResult.FilePath
+                $script:pdfCertificatePath = $partialCertResult.PdfFilePath
+                $script:licenseTier = $partialCertResult.LicenseTier
                 Write-OperationLog -Message "Partial erasure certificate generated (timeout): $($partialCertResult.FilePath)" -LogLevel 'WARNING'
+                if ($partialCertResult.PdfFilePath) {
+                    Write-OperationLog -Message "Partial PDF certificate generated (timeout): $($partialCertResult.PdfFilePath)" -LogLevel 'WARNING'
+                }
             }
         }
         catch {
@@ -160,13 +167,15 @@ function Invoke-SecureDiskErase {
         $stopwatch.Stop()
 
         return [PSCustomObject]@{
-            Success         = $false
-            Message         = $timeoutMsg
-            DiskNumber      = $DiskNumber
-            Method          = $EraseMethod
-            Verified        = $false
-            CertificatePath = $script:certificatePath
-            Duration        = $stopwatch.Elapsed
+            Success            = $false
+            Message            = $timeoutMsg
+            DiskNumber         = $DiskNumber
+            Method             = $EraseMethod
+            Verified           = $false
+            CertificatePath    = $script:certificatePath
+            PdfCertificatePath = $script:pdfCertificatePath
+            LicenseTier        = $script:licenseTier
+            Duration           = $stopwatch.Elapsed
         }
     }
 
@@ -177,13 +186,15 @@ function Invoke-SecureDiskErase {
         if (-not $operationLock.Acquired) {
             $stopwatch.Stop()
             return [PSCustomObject]@{
-                Success         = $false
-                Message         = $operationLock.Message
-                DiskNumber      = $DiskNumber
-                Method          = $EraseMethod
-                Verified        = $false
-                CertificatePath = $null
-                Duration        = $stopwatch.Elapsed
+                Success            = $false
+                Message            = $operationLock.Message
+                DiskNumber         = $DiskNumber
+                Method             = $EraseMethod
+                Verified           = $false
+                CertificatePath    = $null
+                PdfCertificatePath = $null
+                LicenseTier        = $licenseTier
+                Duration           = $stopwatch.Elapsed
             }
         }
 
@@ -201,13 +212,15 @@ function Invoke-SecureDiskErase {
             $stopwatch.Stop()
 
             return [PSCustomObject]@{
-                Success         = $false
-                Message         = $msg
-                DiskNumber      = $DiskNumber
-                Method          = $EraseMethod
-                Verified        = $false
-                CertificatePath = $null
-                Duration        = $stopwatch.Elapsed
+                Success            = $false
+                Message            = $msg
+                DiskNumber         = $DiskNumber
+                Method             = $EraseMethod
+                Verified           = $false
+                CertificatePath    = $null
+                PdfCertificatePath = $null
+                LicenseTier        = $licenseTier
+                Duration           = $stopwatch.Elapsed
             }
         }
 
@@ -248,13 +261,15 @@ function Invoke-SecureDiskErase {
             Write-OperationLog -Message 'Disk erase cancelled by user.' -LogLevel 'INFO'
 
             return [PSCustomObject]@{
-                Success         = $false
-                Message         = 'Disk erase cancelled by user.'
-                DiskNumber      = $DiskNumber
-                Method          = $EraseMethod
-                Verified        = $false
-                CertificatePath = $null
-                Duration        = $stopwatch.Elapsed
+                Success            = $false
+                Message            = 'Disk erase cancelled by user.'
+                DiskNumber         = $DiskNumber
+                Method             = $EraseMethod
+                Verified           = $false
+                CertificatePath    = $null
+                PdfCertificatePath = $null
+                LicenseTier        = $licenseTier
+                Duration           = $stopwatch.Elapsed
             }
         }
 
@@ -535,8 +550,10 @@ function Invoke-SecureDiskErase {
 
             if ($certResult.Success) {
                 $certificatePath = $certResult.FilePath
+                $pdfCertificatePath = $certResult.PdfFilePath
+                $licenseTier = $certResult.LicenseTier
                 Write-OperationLog -Message "Erasure certificate generated: $certificatePath (ID: $($certResult.CertificateId))" -LogLevel 'SUCCESS'
-                Write-AuditLog -EventType 'CertificateGenerated' -Message "Certificate ID: $($certResult.CertificateId), Path: $certificatePath" -TargetDescription "Disk $DiskNumber"
+                Write-AuditLog -EventType 'CertificateGenerated' -Message "Certificate ID: $($certResult.CertificateId), Path: $certificatePath, PDF: $pdfCertificatePath, Tier: $licenseTier" -TargetDescription "Disk $DiskNumber"
             }
             else {
                 Write-OperationLog -Message 'Failed to generate erasure certificate.' -LogLevel 'WARNING'
@@ -555,13 +572,15 @@ function Invoke-SecureDiskErase {
         Write-AuditLog -EventType 'OperationCompleted' -Message $message -TargetDescription "Disk $DiskNumber"
 
         [PSCustomObject]@{
-            Success         = $true
-            Message         = $message
-            DiskNumber      = $DiskNumber
-            Method          = $EraseMethod
-            Verified        = $verified
-            CertificatePath = $certificatePath
-            Duration        = $stopwatch.Elapsed
+            Success            = $true
+            Message            = $message
+            DiskNumber         = $DiskNumber
+            Method             = $EraseMethod
+            Verified           = $verified
+            CertificatePath    = $certificatePath
+            PdfCertificatePath = $pdfCertificatePath
+            LicenseTier        = $licenseTier
+            Duration           = $stopwatch.Elapsed
         }
     }
     catch {
@@ -571,13 +590,15 @@ function Invoke-SecureDiskErase {
         Write-AuditLog -EventType 'OperationFailed' -Message $errorMessage -TargetDescription "Disk $DiskNumber"
 
         [PSCustomObject]@{
-            Success         = $false
-            Message         = $errorMessage
-            DiskNumber      = $DiskNumber
-            Method          = $EraseMethod
-            Verified        = $false
-            CertificatePath = $null
-            Duration        = $stopwatch.Elapsed
+            Success            = $false
+            Message            = $errorMessage
+            DiskNumber         = $DiskNumber
+            Method             = $EraseMethod
+            Verified           = $false
+            CertificatePath    = $null
+            PdfCertificatePath = $null
+            LicenseTier        = $licenseTier
+            Duration           = $stopwatch.Elapsed
         }
     }
     finally {

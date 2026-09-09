@@ -16,8 +16,9 @@ function New-ErasureCertificate {
         operations complete. It logs the certificate creation via Write-OperationLog.
 
     .PARAMETER OperationType
-        The type of erasure operation performed. Must be 'DiskErase' for full-disk
-        overwrite operations or 'UserWipe' for user profile data destruction.
+        The type of erasure operation performed. 'DiskErase' for full-disk overwrite
+        operations, 'UserWipe' for user profile data destruction, or 'ReissueWipe' for a
+        whole-device reissue wipe that leaves the operating system installed.
 
     .PARAMETER TargetDescription
         A human-readable description of the erasure target (e.g. "PhysicalDrive1 -
@@ -53,8 +54,10 @@ function New-ErasureCertificate {
     .OUTPUTS
         PSCustomObject with the following properties:
             CertificateId  - [guid]   Unique identifier for the certificate.
-            FilePath       - [string] Full path to the generated certificate file.
-            Success        - [bool]   Whether the certificate was written successfully.
+            FilePath       - [string] Full path to the generated .txt certificate file.
+            PdfFilePath    - [string] Path to the generated .pdf cert (Pro+ tier only; $null on Free).
+            Success        - [bool]   Whether the .txt certificate was written successfully.
+            LicenseTier    - [string] Active license tier at generation time (Free, Pro, Team, MSP).
 
     .EXAMPLE
         $cert = New-ErasureCertificate -OperationType 'DiskErase' `
@@ -83,7 +86,7 @@ function New-ErasureCertificate {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('DiskErase', 'UserWipe')]
+        [ValidateSet('DiskErase', 'UserWipe', 'ReissueWipe')]
         [string]$OperationType,
 
         [Parameter(Mandatory)]
@@ -114,9 +117,15 @@ function New-ErasureCertificate {
     $fileName  = "ErasureCert_${OperationType}_${dateStr}.txt"
     $certDir   = $Script:EraseDriveConfig.CertDirectory
     $filePath  = Join-Path $certDir $fileName
+    $pdfPath   = $null
     $version   = $Script:EraseDriveConfig.Version
 
-    Write-OperationLog -Message "Generating erasure certificate: $fileName" -LogLevel 'INFO'
+    # Check active license tier. Free returns no license metadata; Pro+ unlocks the PDF.
+    $licenseInfo = Test-EraseDriveLicense -Silent
+    $licenseTier = $licenseInfo.Tier
+    $isPaidTier  = $licenseInfo.Valid -and ($licenseTier -in @('Pro', 'Team', 'MSP'))
+
+    Write-OperationLog -Message "Generating erasure certificate: $fileName (license tier: $licenseTier)" -LogLevel 'INFO'
 
     try {
         # Ensure the certificate directory exists
@@ -188,6 +197,20 @@ function New-ErasureCertificate {
         }
         [void]$sb.AppendLine()
 
+        # ---- License ----
+        [void]$sb.AppendLine('--- LICENSE ---')
+        if ($isPaidTier) {
+            [void]$sb.AppendLine("Tier:               $licenseTier")
+            [void]$sb.AppendLine("License ID:         $($licenseInfo.LicenseId)")
+            [void]$sb.AppendLine("Issued To:          $($licenseInfo.IssuedTo)")
+        }
+        else {
+            [void]$sb.AppendLine('Tier:               Free (no license)')
+            [void]$sb.AppendLine('Note:               Free tier produces .txt only. Pro license unlocks the')
+            [void]$sb.AppendLine('                    signed PDF Certificate of Destruction at erasedrive.io')
+        }
+        [void]$sb.AppendLine()
+
         # ---- Compliance ----
         [void]$sb.AppendLine('--- COMPLIANCE ---')
         [void]$sb.AppendLine('This erasure follows NIST SP 800-88 Rev.1 Clear guidelines.')
@@ -244,10 +267,50 @@ function New-ErasureCertificate {
         Write-OperationLog -Message "Erasure certificate saved: $filePath (ID: $certId)" -LogLevel 'SUCCESS'
         Write-OperationLog -Message "Certificate signature file saved: $sigFilePath" -LogLevel 'INFO'
 
+        # ---- PDF rendering (Pro+ license only) ----
+        if ($isPaidTier) {
+            try {
+                $pdfPath = [System.IO.Path]::ChangeExtension($filePath, '.pdf')
+                $pdfResult = New-PdfCertificate `
+                    -OutPath          $pdfPath `
+                    -CertificateId    $certId `
+                    -Timestamp        $timestamp `
+                    -OperationType    $OperationType `
+                    -TargetDescription $TargetDescription `
+                    -Method           $Method `
+                    -MethodDescription $methodDescription `
+                    -DiskSerial       $DiskSerial `
+                    -DiskModel        $DiskModel `
+                    -DiskSizeGB       $DiskSizeGB `
+                    -VerificationResult $VerificationResult `
+                    -OperatorName     $OperatorName `
+                    -MachineName      $env:COMPUTERNAME `
+                    -ToolVersion      $version `
+                    -HmacHex          $hmacHex `
+                    -LicenseTier      $licenseTier `
+                    -LicenseId        $licenseInfo.LicenseId `
+                    -LicenseIssuedTo  $licenseInfo.IssuedTo
+
+                if ($pdfResult.Success) {
+                    Write-OperationLog -Message "PDF certificate saved: $($pdfResult.FilePath)" -LogLevel 'SUCCESS'
+                }
+                else {
+                    Write-OperationLog -Message "PDF certificate generation failed: $($pdfResult.Message)" -LogLevel 'WARNING'
+                    $pdfPath = $null
+                }
+            }
+            catch {
+                Write-OperationLog -Message "PDF certificate generation error: $($_.Exception.Message)" -LogLevel 'WARNING'
+                $pdfPath = $null
+            }
+        }
+
         return [PSCustomObject]@{
             CertificateId = $certId
             FilePath      = $filePath
+            PdfFilePath   = $pdfPath
             Success       = $true
+            LicenseTier   = $licenseTier
         }
     }
     catch {
@@ -257,7 +320,9 @@ function New-ErasureCertificate {
         return [PSCustomObject]@{
             CertificateId = $certId
             FilePath      = $null
+            PdfFilePath   = $null
             Success       = $false
+            LicenseTier   = $licenseTier
         }
     }
 }

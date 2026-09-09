@@ -21,9 +21,11 @@ BeforeAll {
         LogDirectory  = Join-Path $TestDrive 'Logs'
         LogFile       = Join-Path $TestDrive 'Logs' 'EraseDrive.log'
         CertDirectory = Join-Path $TestDrive 'Certs'
+        LicensePath   = Join-Path $TestDrive 'license.lic'
+        PublicKeyPath = Join-Path $TestDrive 'public-key-that-does-not-exist.xml'
         MaxLogSizeMB  = 1
         MaxLogFiles   = 3
-        Version       = '3.0.0'
+        Version       = '3.1.0'
     }
 
     New-Item -Path $Script:EraseDriveConfig.LogDirectory -ItemType Directory -Force | Out-Null
@@ -46,7 +48,7 @@ Describe 'Module Structure' {
 
     It 'Has a valid module manifest' {
         $manifest | Should -Not -BeNullOrEmpty
-        $manifest.Version.ToString() | Should -Be '3.0.0'
+        $manifest.Version.ToString() | Should -Be '3.1.0'
     }
 
     It 'Has the root module loader (EraseDrive.psm1)' {
@@ -65,7 +67,9 @@ Describe 'Module Structure' {
             'Get-DiskMediaType.ps1',
             'Invoke-SecureOverwrite.ps1',
             'Test-EraseVerification.ps1',
-            'New-ErasureCertificate.ps1'
+            'New-ErasureCertificate.ps1',
+            'Test-EraseDriveLicense.ps1',
+            'New-PdfCertificate.ps1'
         )
 
         foreach ($file in $expectedPrivate) {

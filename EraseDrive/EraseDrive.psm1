@@ -12,7 +12,7 @@
 
 .NOTES
     Module:  EraseDrive
-    Version: 3.0.0
+    Version: 3.1.0
     Author:  DarkHorse InfoSec
 #>
 
@@ -21,9 +21,20 @@ $Script:EraseDriveConfig = @{
     LogDirectory    = Join-Path $env:ProgramData 'DarkHorse\EraseDrive'
     LogFile         = Join-Path $env:ProgramData 'DarkHorse\EraseDrive\EraseDrive.log'
     CertDirectory   = Join-Path $env:ProgramData 'DarkHorse\EraseDrive\Certificates'
+    LicensePath     = Join-Path $env:ProgramData 'DarkHorse\EraseDrive\license.lic'
+    PublicKeyPath   = Join-Path $PSScriptRoot 'EraseDriveLicense.pub'
     MaxLogSizeMB    = 10
     MaxLogFiles     = 5
-    Version         = '3.0.0'
+    Version         = '3.1.0'
+
+    # Where this module was loaded from. Set-EraseDriveEvidenceRoot uses the parent of
+    # this path to keep destruction certificates on the operator's USB stick rather than
+    # on the machine being wiped and handed over.
+    ModuleRoot      = $PSScriptRoot
+
+    # Populated by Set-EraseDriveEvidenceRoot at the start of an operation. Null means
+    # the module is still using its ProgramData defaults.
+    EvidenceRoot    = $null
 }
 
 # Ensure log and certificate directories exist

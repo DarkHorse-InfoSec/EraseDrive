@@ -28,7 +28,7 @@ function Start-EraseDriveGUI {
         Requires Administrator privileges.
         Requires .NET Framework 4.5+ (System.Windows.Forms, System.Drawing).
         Module:  EraseDrive
-        Version: 3.0.0
+        Version: 3.1.0
         Author:  DarkHorse InfoSec
 
     .OUTPUTS
@@ -205,8 +205,38 @@ function Start-EraseDriveGUI {
     $lblStatus.ForeColor = $cGreenAccent
     $lblStatus.AutoSize  = $true
     $lblStatus.Anchor    = 'Top, Right'
-    $lblStatus.Location  = New-Object System.Drawing.Point(940, 30)
+    $lblStatus.Location  = New-Object System.Drawing.Point(940, 18)
     $headerPanel.Controls.Add($lblStatus)
+
+    # License tier badge (below status, right-aligned)
+    $lblTier = New-Object System.Windows.Forms.Label
+    $lblTier.Text      = 'TIER: FREE'
+    $lblTier.Font      = $fontSubtitle
+    $lblTier.ForeColor = $cDimText
+    $lblTier.AutoSize  = $true
+    $lblTier.Anchor    = 'Top, Right'
+    $lblTier.Location  = New-Object System.Drawing.Point(900, 48)
+    $headerPanel.Controls.Add($lblTier)
+
+    # Helper to refresh the tier badge from the active license
+    $script:currentLicense = $null
+    $refreshTierBadge = {
+        try {
+            $script:currentLicense = Test-EraseDriveLicense -Silent
+        }
+        catch {
+            $script:currentLicense = [PSCustomObject]@{ Tier = 'Free'; Valid = $false }
+        }
+        $tier = $script:currentLicense.Tier
+        $lblTier.Text = "TIER: $($tier.ToUpper())"
+        switch ($tier) {
+            'Free' { $lblTier.ForeColor = $cDimText }
+            'Pro'  { $lblTier.ForeColor = $cGreenAccent }
+            'Team' { $lblTier.ForeColor = $cBlueAccent }
+            'MSP'  { $lblTier.ForeColor = [System.Drawing.Color]::FromArgb(190, 130, 230) }
+            default { $lblTier.ForeColor = $cDimText }
+        }
+    }
 
     $form.Controls.Add($headerPanel)
 
@@ -421,6 +451,8 @@ function Start-EraseDriveGUI {
     $btnCancel    = New-ThemedButton -Text 'CANCEL'             -BgColor $cOrangeAccent  -X 460  -Y 10 -Width 100 -Height 35
     $btnCancel.Visible = $false
 
+    $btnLoadLicense = New-ThemedButton -Text 'LOAD LICENSE' -BgColor ([System.Drawing.Color]::FromArgb(140, 100, 200)) -X 770 -Y 10 -Width 140 -Height 35
+
     $btnExit = New-ThemedButton -Text 'EXIT' -BgColor ([System.Drawing.Color]::FromArgb(90, 90, 90)) -X 920 -Y 10 -Width 80 -Height 35
 
     # Method ComboBox
@@ -459,7 +491,7 @@ function Start-EraseDriveGUI {
     $chkClearLogs.Font      = $fontNormal
 
     $controlPanel.Controls.AddRange(@(
-        $btnUserWipe, $btnEraseDisk, $btnRefresh, $btnCancel, $btnExit,
+        $btnUserWipe, $btnEraseDisk, $btnRefresh, $btnCancel, $btnLoadLicense, $btnExit,
         $lblMethod, $cmbMethod, $chkBackup, $chkClearLogs
     ))
     $form.Controls.Add($controlPanel)
@@ -621,13 +653,22 @@ function Start-EraseDriveGUI {
                     $msg += "`nDuration: $($result.Duration)"
                 }
                 if ($result.CertificatePath) {
-                    $msg += "`nCertificate: $($result.CertificatePath)"
+                    $msg += "`nCertificate (TXT): $($result.CertificatePath)"
+                }
+                if ($result.PSObject.Properties['PdfCertificatePath'] -and $result.PdfCertificatePath) {
+                    $msg += "`nCertificate (PDF): $($result.PdfCertificatePath)"
                 }
                 if ($result.ProfilesRemoved) {
                     $msg += "`nProfiles removed: $($result.ProfilesRemoved -join ', ')"
                 }
                 if ($result.PSObject.Properties['Verified']) {
                     $msg += "`nVerified: $($result.Verified)"
+                }
+
+                # Free-tier upgrade nudge
+                $tierForNudge = if ($result.PSObject.Properties['LicenseTier']) { $result.LicenseTier } else { 'Free' }
+                if ($tierForNudge -eq 'Free') {
+                    $msg += "`n`nUpgrade to Pro for a signed PDF Certificate of Destruction your auditor will accept. erasedrive.io"
                 }
 
                 Write-OperationLog -Message "GUI operation completed: $($result.Message)" -LogLevel 'SUCCESS'
@@ -808,6 +849,64 @@ function Start-EraseDriveGUI {
         & $refreshDisks
     })
 
+    # ── LOAD LICENSE ──────────────────────────────────────────────────────────
+    $btnLoadLicense.Add_Click({
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Title = 'Select EraseDrive license file (.lic)'
+        $ofd.Filter = 'EraseDrive license (*.lic)|*.lic|All files (*.*)|*.*'
+        $ofd.Multiselect = $false
+
+        if ($ofd.ShowDialog() -ne 'OK') { return }
+
+        $sourcePath = $ofd.FileName
+
+        # Validate the chosen file BEFORE copying so we don't clobber an existing valid license with garbage
+        try {
+            $check = Test-EraseDriveLicense -LicensePath $sourcePath -Silent
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Could not read license file:`n$($_.Exception.Message)",
+                'License Error', 'OK', 'Error'
+            )
+            return
+        }
+
+        if (-not $check.Valid) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "This license file is not valid.`n`nReason: $($check.Reason)`n`nNothing was changed. If you believe this is wrong, contact support with your purchase ID.",
+                'Invalid License', 'OK', 'Warning'
+            )
+            return
+        }
+
+        # Copy to the canonical location
+        $destPath = $Script:EraseDriveConfig.LicensePath
+        $destDir = Split-Path $destPath -Parent
+        try {
+            if (-not (Test-Path $destDir)) {
+                New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $sourcePath -Destination $destPath -Force -ErrorAction Stop
+            Write-OperationLog -Message "License loaded into $destPath (Tier: $($check.Tier), ID: $($check.LicenseId))" -LogLevel 'SUCCESS'
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Could not install license file to $($destPath):`n$($_.Exception.Message)`n`nTry running EraseDrive as Administrator.",
+                'License Install Failed', 'OK', 'Error'
+            )
+            return
+        }
+
+        # Refresh badge
+        & $refreshTierBadge
+
+        [System.Windows.Forms.MessageBox]::Show(
+            "License loaded.`n`nTier: $($check.Tier)`nIssued to: $($check.IssuedTo)`nLicense ID: $($check.LicenseId)`n`nFuture certificates will include the signed PDF Certificate of Destruction.",
+            'License Activated', 'OK', 'Information'
+        )
+    })
+
     # ── CANCEL ────────────────────────────────────────────────────────────────
     $btnCancel.Add_Click({
         if (-not $script:operationRunning -or $null -eq $script:ps) { return }
@@ -888,6 +987,8 @@ function Start-EraseDriveGUI {
     #  INITIAL LOAD & LAUNCH
     # ══════════════════════════════════════════════════════════════════════════
     Write-OperationLog -Message "EraseDrive GUI v$($Script:EraseDriveConfig.Version) started." -LogLevel 'INFO'
+    & $refreshTierBadge
+    Write-OperationLog -Message "Active license tier: $($script:currentLicense.Tier)" -LogLevel 'INFO'
     & $refreshDisks
 
     [System.Windows.Forms.Application]::Run($form)
