@@ -15,7 +15,7 @@ BeforeAll {
     # Hermetic per-test config for the module-scope variable
     $Script:EraseDriveConfig = @{
         LogDirectory   = Join-Path $TestDrive 'Logs'
-        LogFile        = Join-Path $TestDrive 'Logs' 'EraseDrive.log'
+        LogFile        = Join-Path (Join-Path $TestDrive 'Logs') 'EraseDrive.log'
         CertDirectory  = Join-Path $TestDrive 'Certs'
         LicensePath    = Join-Path $TestDrive 'license.lic'
         PublicKeyPath  = Join-Path $TestDrive 'public.xml'

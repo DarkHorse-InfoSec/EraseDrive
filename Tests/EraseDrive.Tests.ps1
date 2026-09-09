@@ -19,7 +19,7 @@ BeforeAll {
     # Set up module config in script scope so functions can find it
     $Script:EraseDriveConfig = @{
         LogDirectory  = Join-Path $TestDrive 'Logs'
-        LogFile       = Join-Path $TestDrive 'Logs' 'EraseDrive.log'
+        LogFile       = Join-Path (Join-Path $TestDrive 'Logs') 'EraseDrive.log'
         CertDirectory = Join-Path $TestDrive 'Certs'
         LicensePath   = Join-Path $TestDrive 'license.lic'
         PublicKeyPath = Join-Path $TestDrive 'public-key-that-does-not-exist.xml'
@@ -106,7 +106,7 @@ Describe 'Module Structure' {
 Describe 'Write-OperationLog' {
     BeforeEach {
         # Reset log file path for each test
-        $Script:EraseDriveConfig.LogFile = Join-Path $TestDrive 'Logs' 'EraseDrive.log'
+        $Script:EraseDriveConfig.LogFile = Join-Path (Join-Path $TestDrive 'Logs') 'EraseDrive.log'
         $Script:EraseDriveConfig.LogDirectory = Join-Path $TestDrive 'Logs'
         if (Test-Path $Script:EraseDriveConfig.LogFile) {
             Remove-Item $Script:EraseDriveConfig.LogFile -Force
@@ -582,7 +582,7 @@ Describe 'Invoke-ForensicUserDataWipe' {
         Mock New-ErasureCertificate {
             [PSCustomObject]@{
                 CertificateId = [guid]::NewGuid()
-                FilePath      = Join-Path $TestDrive 'Certs' 'TestCert.txt'
+                FilePath      = Join-Path (Join-Path $TestDrive 'Certs') 'TestCert.txt'
                 Success       = $true
             }
         }
@@ -721,7 +721,7 @@ Describe 'Invoke-SecureDiskErase' {
         Mock New-ErasureCertificate {
             [PSCustomObject]@{
                 CertificateId = [guid]::NewGuid()
-                FilePath      = Join-Path $TestDrive 'Certs' 'DiskCert.txt'
+                FilePath      = Join-Path (Join-Path $TestDrive 'Certs') 'DiskCert.txt'
                 Success       = $true
             }
         }
@@ -1252,7 +1252,7 @@ Describe 'Invoke-SecureDiskErase - Round 2 Features' {
         Mock New-ErasureCertificate {
             [PSCustomObject]@{
                 CertificateId = [guid]::NewGuid()
-                FilePath      = Join-Path $TestDrive 'Certs' 'DiskCert.txt'
+                FilePath      = Join-Path (Join-Path $TestDrive 'Certs') 'DiskCert.txt'
                 Success       = $true
             }
         }
