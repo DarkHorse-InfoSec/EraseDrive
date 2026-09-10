@@ -212,6 +212,35 @@ Describe 'ConvertFrom-AtaIdentifyDevice' {
         $r2.PurgeMethods | Should -Contain 'ATA SANITIZE, CRYPTO SCRAMBLE EXT'
     }
 
+    It 'Reads word 59 bits 10 and 11 without crediting either toward Purge' {
+        # Verified against ACS-3 Table 45 (p.106): bit 10 SANITIZE ANTIFREEZE
+        # LOCK EXT supported, bit 11 commands-during-sanitize follow ACS-3 rules.
+        # They are operator-relevant for Phase 3 and must never reach PurgeMethods.
+        $neither = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 0x0000)
+        $neither.SupportsSanitizeAntifreezeLock | Should -BeFalse
+        $neither.SanitizeCommandsPerAcs3        | Should -BeFalse
+
+        $antifreeze = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 0x0400)
+        $antifreeze.SupportsSanitizeAntifreezeLock | Should -BeTrue
+        $antifreeze.SanitizeCommandsPerAcs3        | Should -BeFalse
+        $antifreeze.PurgeMethods                   | Should -BeNullOrEmpty -Because 'bit 10 is not a Purge command'
+
+        $acs3 = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 0x0800)
+        $acs3.SupportsSanitizeAntifreezeLock | Should -BeFalse
+        $acs3.SanitizeCommandsPerAcs3        | Should -BeTrue
+        $acs3.PurgeMethods                   | Should -BeNullOrEmpty -Because 'bit 11 is not a Purge command'
+
+        $both = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 0x0C00)
+        $both.SupportsSanitizeAntifreezeLock | Should -BeTrue
+        $both.SanitizeCommandsPerAcs3        | Should -BeTrue
+    }
+
+    It 'Reports the new bits as $null, not $false, when the buffer is short' {
+        $r = ConvertFrom-AtaIdentifyDevice (New-Object byte[] 16)
+        $null -eq $r.SupportsSanitizeAntifreezeLock | Should -BeTrue
+        $null -eq $r.SanitizeCommandsPerAcs3        | Should -BeTrue
+    }
+
     It 'Detects the security frozen bit, which is the normal post-boot state' {
         $frozen    = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word128 0x0008)
         $notFrozen = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word128 0x0000)

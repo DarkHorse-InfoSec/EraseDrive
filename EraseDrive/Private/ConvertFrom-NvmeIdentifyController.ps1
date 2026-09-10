@@ -12,11 +12,33 @@ function ConvertFrom-NvmeIdentifyController {
         capability bits rather than against whichever drive happens to be in the
         machine.
 
+        VERIFIED 2026-09-10 against NVM Express Base Specification, Revision 2.1
+        (2024-08-05, Ratified), Figure 312 "Identify - Identify Controller Data
+        Structure, I/O Command Set Independent": OACS byte 257:256 (p.307-308),
+        SANICAP byte 331:328 (p.315), FNA byte 524 (p.321).
+          nvmexpress.org/wp-content/uploads/
+            NVM-Express-Base-Specification-Revision-2.1-2024.08.05-Ratified.pdf
+        Cross-checked against libnvme src/nvme/types.h (NVME_CTRL_OACS_* /
+        SANICAP_* / FNA_* enums), QEMU include/block/nvme.h (enum NvmeIdCtrlOacs)
+        and Microsoft's NVME_IDENTIFY_CONTROLLER_DATA. The byte offsets were also
+        recomputed independently by summing field sizes in the Linux kernel's
+        struct nvme_id_ctrl, which lands on 256, 328 and 524 exactly.
+
+        No bit position below was found to be wrong. SANICAP arrived in NVMe 1.3;
+        a controller predating it reports the field as zero, which this function
+        already renders as "not supported".
+
         Field offsets are from the NVM Express Base Specification, Figure
         "Identify Controller Data Structure":
 
           Bytes 256:257  OACS    Optional Admin Command Support
                                  bit 1 = Format NVM command supported
+                                 There is NO "Sanitize supported" bit in OACS.
+                                 Sanitize support is signalled entirely by
+                                 SANICAP being non-zero. Verified against the
+                                 spec's own OACS bit list (bits 0-11 named,
+                                 12-15 reserved) so that a later reader auditing
+                                 this file does not go looking for one.
           Bytes 328:331  SANICAP Sanitize Capabilities
                                  bit 0 = Crypto Erase Sanitize supported
                                  bit 1 = Block Erase Sanitize supported

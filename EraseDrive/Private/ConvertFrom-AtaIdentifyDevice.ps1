@@ -11,10 +11,16 @@ function ConvertFrom-AtaIdentifyDevice {
         Field offsets are from the ATA Command Set (ACS) IDENTIFY DEVICE data,
         which is defined in 16-bit WORDS. Word N begins at byte offset N * 2.
 
-          Word 59   bit 12 = SANITIZE feature set supported
+          Word 59   bit 10 = SANITIZE ANTIFREEZE LOCK EXT supported
+                    bit 11 = commands allowed during sanitize follow ACS-3 (1)
+                             rather than ACS-2 (0) rules
+                    bit 12 = SANITIZE feature set supported
                     bit 13 = CRYPTO SCRAMBLE EXT supported
                     bit 14 = OVERWRITE EXT supported
                     bit 15 = BLOCK ERASE EXT supported
+                    bits 0-8 are the legacy logical-sectors-per-DRQ-block
+                             setting, obsoleted in ACS-4; bit 9 is reserved.
+                             Nothing there affects sanitize.
           Word 82   bit 1  = Security feature set supported
           Word 85   bit 1  = Security feature set enabled
           Word 128         = Security status
@@ -25,26 +31,30 @@ function ConvertFrom-AtaIdentifyDevice {
                     bit 4  = Security count expired
                     bit 5  = Enhanced security erase supported
 
-        UNVERIFIED, and it must be resolved before Phase 3 issues any command
-        based on it: the word 59 bit assignments above are recorded from the ACS
-        specification but were NOT checked against the published standard while
-        this was written, because no copy of ACS-4 is available on this machine
-        and the reference library has no storage material (D:\Books\BOOKLIST.md
-        names DFIR as an explicit gap). The word 128 and word 82/85 assignments
-        are the long-standing, widely implemented ones and are not in doubt.
+        VERIFIED 2026-09-10. Every bit position above was checked against the
+        primary standard text and corroborated by two independent implementations
+        before Phase 3 is allowed to gate a destructive command on any of them.
+        No assignment was found to be wrong.
 
-        Separately, the NIST half of this deferral is NO LONGER OPEN. Which of
-        these commands is credited as Purge was verified against the published
-        SP 800-88 Rev.1 on 2026-09-10, and the crediting block below now cites
-        it directly. That verification says nothing about the bit positions
-        above, which are a different question against a different standard.
+          Primary: T13/2161-D Revision 5, "ATA/ATAPI Command Set - 3 (ACS-3)",
+          2013-10-28, Table 45 "IDENTIFY DEVICE data": word 59 (p.106), word 82
+          (p.110), word 85 (p.113), word 128 (p.121, described in 7.12.7.66,
+          p.137). Public mirror: people.freebsd.org/~imp/asiabsdcon2015/works/
+          d2161r5-ATAATAPI_Command_Set_-_3.pdf   (canonical home: t13.org)
 
-        This is safe to ship in Phase 1 because Phase 1 only REPORTS, and the raw
-        word is always returned alongside the interpretation so a wrong bit is
-        visible rather than silent. It is NOT safe to ship in Phase 3, where the
-        same bits would gate issuing a destructive command. Phase 3's definition
-        of done must include checking word 59 against ACS-4 and either confirming
-        or correcting this block.
+          Cross-checks: smartmontools src/ataidentify.cpp word 59/82/85 tables
+          (github.com/smartmontools/smartmontools), and FreeBSD sys/sys/ata.h
+          ATA_SUPPORT_* / ATA_SECURITY_* defines (github.com/freebsd/freebsd-src).
+
+        Note on revision drift, since a real drive may report an older revision.
+        Word 59 bits 10-15 are current through ACS-4; smartmontools tags bits 0-8
+        [OBS-ACS-4] and this function does not read them. A drive predating ACS-3
+        has no Sanitize feature set at all and reports these bits as zero, which
+        this function already renders as "not supported" rather than unknown, and
+        that is the correct reading for a device that cannot do it.
+
+        The original deferral recorded here claimed no copy of the standard was
+        available. It was public the whole time. See tasks/lessons.md.
 
     .PARAMETER Bytes
         The IDENTIFY DEVICE response. Must be at least 512 bytes.
@@ -82,6 +92,8 @@ function ConvertFrom-AtaIdentifyDevice {
             SerialNumber          = $null
             FirmwareRevision      = $null
             SupportsSanitize      = $null
+            SupportsSanitizeAntifreezeLock = $null
+            SanitizeCommandsPerAcs3        = $null
             SupportsCryptoScramble = $null
             SupportsBlockErase    = $null
             SupportsOverwriteExt  = $null
@@ -122,6 +134,14 @@ function ConvertFrom-AtaIdentifyDevice {
     $cryptoScramble    = [bool]($word59 -band 0x2000)
     $overwriteExt      = [bool]($word59 -band 0x4000)
     $blockErase        = [bool]($word59 -band 0x8000)
+
+    # Bits 10 and 11 are part of the same Sanitize feature block and are reported
+    # rather than dropped. Neither is credited toward Purge; both matter to a
+    # Phase 3 operator. ANTIFREEZE LOCK changes how the drive behaves around
+    # SECURITY FREEZE LOCK, which is the blocker most likely to stop a real
+    # sanitize, and the ACS-3 bit says which command-during-sanitize rules apply.
+    $antifreezeLock    = [bool]($word59 -band 0x0400)
+    $sanitizePerAcs3   = [bool]($word59 -band 0x0800)
 
     $securitySupported = [bool]($word82 -band 0x0002)
     $securityEnabled   = [bool]($word85 -band 0x0002)
@@ -224,6 +244,8 @@ function ConvertFrom-AtaIdentifyDevice {
         SerialNumber           = $serial
         FirmwareRevision       = $firmware
         SupportsSanitize       = $sanitizeSupported
+        SupportsSanitizeAntifreezeLock = $antifreezeLock
+        SanitizeCommandsPerAcs3        = $sanitizePerAcs3
         SupportsCryptoScramble = $cryptoScramble
         SupportsBlockErase     = $blockErase
         SupportsOverwriteExt   = $overwriteExt
