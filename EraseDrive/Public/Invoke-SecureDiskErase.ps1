@@ -218,6 +218,34 @@ function Invoke-SecureDiskErase {
         }
     }
 
+    # Clear-Disk that treats "nothing to clear" as success.
+    #
+    # Clear-Disk throws "The disk has not been initialized" on a RAW disk, and
+    # -ErrorAction Stop turned that into a failed erase. A raw disk is not an error
+    # condition here: it is a disk with no partition table, which is precisely the
+    # state Clear-Disk exists to produce. Refusing to erase one meant a brand-new
+    # disk, or any disk already cleaned by a previous EraseDrive run, could not be
+    # erased at all. Found 2026-09-10 the first time the tool was pointed at a
+    # genuinely uninitialized device.
+    #
+    # Anything OTHER than that condition is still fatal and rethrown.
+    $clearDiskTolerant = {
+        param([string]$Context)
+        try {
+            Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
+            Write-OperationLog -Message "Clear-Disk completed for disk $DiskNumber ($Context)" -LogLevel 'INFO'
+        }
+        catch {
+            $m = "$($_.Exception.Message)"
+            if ($m -match 'has not been initialized' -or $m -match 'no partitions|not contain any partitions') {
+                Write-OperationLog -Message "Clear-Disk had nothing to remove on disk $DiskNumber ($Context): the disk is already raw. Continuing." -LogLevel 'INFO'
+            }
+            else {
+                throw
+            }
+        }
+    }
+
     # Helper to check timeout; returns $true if timed out
     $checkTimeout = {
         if ($TimeoutMinutes -gt 0 -and $stopwatch.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
@@ -395,8 +423,7 @@ function Invoke-SecureDiskErase {
             Write-OperationLog -Message "Executing Clear-Disk for disk $DiskNumber (Quick). NOTE: Quick writes nothing to the media; data remains recoverable." -LogLevel 'WARNING'
 
             & $assertDiskIdentity
-            Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
-            Write-OperationLog -Message "Clear-Disk completed for disk $DiskNumber (Quick)" -LogLevel 'SUCCESS'
+            & $clearDiskTolerant 'Quick'
 
             & $reportStep 70 'Partitions removed' 'Quick finished (no data was overwritten)'
         }
@@ -415,8 +442,7 @@ function Invoke-SecureDiskErase {
             Write-OperationLog -Message "Executing Clear-Disk for disk $DiskNumber (Standard)" -LogLevel 'INFO'
 
             & $assertDiskIdentity
-            Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
-            Write-OperationLog -Message "Clear-Disk completed for disk $DiskNumber" -LogLevel 'INFO'
+            & $clearDiskTolerant 'Standard'
 
             if (& $checkTimeout) {
                 return (& $handleTimeoutAbort $diskDescription 'Standard (Clear-Disk + single-pass zero overwrite)' $diskSerial $diskModel $diskSizeGB)
@@ -458,8 +484,7 @@ function Invoke-SecureDiskErase {
                 Write-OperationLog -Message "Performing secure HDD erase on disk $DiskNumber (Clear-Disk + 3-pass overwrite)" -LogLevel 'INFO'
 
                 & $assertDiskIdentity
-                Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
-                Write-OperationLog -Message "Clear-Disk completed for HDD disk $DiskNumber" -LogLevel 'INFO'
+                & $clearDiskTolerant 'Secure HDD'
 
                 # Timeout check before Invoke-SecureOverwrite
                 if (& $checkTimeout) {
@@ -619,8 +644,7 @@ function Invoke-SecureDiskErase {
                     & $reportStep 30 'Fallback: Clear-Disk' 'SSD diskpart failed - falling back to Clear-Disk + overwrite'
 
                     & $assertDiskIdentity
-                    Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
-                    Write-OperationLog -Message "Fallback Clear-Disk completed for SSD disk $DiskNumber" -LogLevel 'INFO'
+                    & $clearDiskTolerant 'Secure SSD fallback'
 
                     # Timeout check before fallback Invoke-SecureOverwrite
                     if (& $checkTimeout) {

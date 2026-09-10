@@ -319,6 +319,37 @@ Describe 'Invoke-SecureDiskErase: write/verify contract' {
         Mock Get-Partition   { @([PSCustomObject]@{ DiskNumber = 1; DriveLetter = 'E' }) }
     }
 
+    It 'erases a genuinely raw, uninitialized disk' -ForEach @(
+        @{ Method = 'Quick' }
+        @{ Method = 'Standard' }
+        @{ Method = 'Secure' }
+    ) {
+        # Found 2026-09-10 by pointing the tool at a freshly attached VHD.
+        # Clear-Disk throws "The disk has not been initialized" on a RAW disk, and
+        # -ErrorAction Stop turned that into a failed erase. That meant a brand-new
+        # disk, or any disk already cleaned by a previous EraseDrive run, could not
+        # be erased at all. The physical stick only worked because it still had a
+        # partition table.
+        Mock Clear-Disk { throw 'The disk has not been initialized.' }
+
+        $result = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod $Method -Confirm:$false
+
+        $result.Success | Should -BeTrue -Because 'a raw disk has nothing to clear, which is not an error'
+        $result.Message | Should -Not -Match 'has not been initialized'
+    }
+
+    It 'still fails when Clear-Disk reports a real problem' {
+        # The tolerance must be narrow. Anything other than "nothing to clear" is
+        # still fatal; a guard that swallowed every Clear-Disk failure would pass
+        # the test above and hide genuine hardware faults.
+        Mock Clear-Disk { throw 'The media is write protected.' }
+
+        $result = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.Message | Should -Match 'write protected'
+    }
+
     It 'Standard actually overwrites the media' {
         # The whole defect in one assertion. Before the fix Standard ran Clear-Disk
         # and returned, so this was zero.
