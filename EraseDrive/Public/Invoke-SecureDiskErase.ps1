@@ -270,6 +270,7 @@ function Invoke-SecureDiskErase {
                 -DiskModel $Model `
                 -DiskSizeGB $SizeGB `
                 -VerificationResult $null `
+                -SanitizeCapability $mediaInfo.SanitizeCapability `
                 -OperatorName ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
 
             if ($partialCertResult.Success) {
@@ -384,7 +385,21 @@ function Invoke-SecureDiskErase {
         $diskDescription = "Disk $DiskNumber ($diskModel, ${diskSizeGB} GB, $mediaType/$protocol, S/N: $diskSerial)"
 
         Write-OperationLog -Message "Target: $diskDescription" -LogLevel 'INFO'
-        Write-OperationLog -Message "Disk ${DiskNumber}: MediaType=$mediaType, Protocol=$protocol, SupportsSecureErase=$($mediaInfo.SupportsSecureErase), SupportsTrim=$($mediaInfo.SupportsTrim)" -LogLevel 'INFO'
+        # SupportsSecureErase is three-state. Rendering $null as an empty string in
+        # the audit log would make "unknown" indistinguishable from "false", so it
+        # is spelled out and the determination is recorded alongside it.
+        $secureEraseText = if ($null -eq $mediaInfo.SupportsSecureErase) { 'UNKNOWN' }
+                           else { [string]$mediaInfo.SupportsSecureErase }
+        $determinationText = if ($mediaInfo.SanitizeCapability) { $mediaInfo.SanitizeCapability.Determination }
+                             else { 'NotAttempted' }
+        Write-OperationLog -Message "Disk ${DiskNumber}: MediaType=$mediaType, Protocol=$protocol, PurgeCapable=$secureEraseText (determination=$determinationText), SupportsTrim=$($mediaInfo.SupportsTrim)" -LogLevel 'INFO'
+
+        if ($mediaInfo.SanitizeCapability -and $mediaInfo.SanitizeCapability.PurgeMethods.Count -gt 0) {
+            Write-OperationLog -Message "Disk ${DiskNumber}: Purge available via $($mediaInfo.SanitizeCapability.PurgeMethods -join '; '), NOT performed by this operation." -LogLevel 'INFO'
+        }
+        foreach ($capBlocker in @($mediaInfo.SanitizeCapability.Blockers)) {
+            if ($capBlocker) { Write-OperationLog -Message "Disk ${DiskNumber}: $capBlocker" -LogLevel 'WARNING' }
+        }
 
         # ── 3. ShouldProcess confirmation ────────────────────────────────
         if (-not $PSCmdlet.ShouldProcess($diskDescription, "$EraseMethod erase (ALL DATA WILL BE DESTROYED)")) {
@@ -917,6 +932,7 @@ function Invoke-SecureDiskErase {
                 -DiskModel $diskModel `
                 -DiskSizeGB $diskSizeGB `
                 -VerificationResult $verificationResult `
+                -SanitizeCapability $mediaInfo.SanitizeCapability `
                 -OperatorName ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
 
             if ($certResult.Success) {

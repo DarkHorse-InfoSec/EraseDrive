@@ -266,6 +266,38 @@ exists because procurement and audit checklists still ask for it.
 cryptographic-erase command. Overwriting an SSD cannot reach over-provisioned or
 wear-levelled blocks. The certificate says so rather than implying otherwise.
 
+Since v3.1.0 EraseDrive **asks the drive** whether Purge is reachable, and prints
+the answer on the certificate. It does this with a read-only
+`IOCTL_STORAGE_QUERY_PROPERTY` query for the NVMe Identify Controller structure
+or the ATA IDENTIFY DEVICE response, and reports the commands the device itself
+advertises, for example:
+
+```
+PURGE: AVAILABLE ON THIS DEVICE BUT NOT PERFORMED.
+The device reports support for:
+  - NVMe Sanitize, block erase
+  - NVMe Format NVM, SES=1 user data erase
+```
+
+**Detection only. EraseDrive does not issue those commands, so it does not
+perform Purge**, and no certificate it produces claims otherwise. The query is
+strictly read-only: the device handle is opened with a desired access of zero,
+which is enough to read properties and not enough to read or write any sector.
+
+Three results are possible and they are deliberately not collapsed into two:
+
+| Report | Meaning |
+|---|---|
+| Purge **available** | The device answered and named at least one qualifying command. |
+| Purge **not available** | Either the device answered and named none, or the bus cannot carry such a command at all (USB bridges, virtual disks). |
+| Purge capability **UNKNOWN** | The device was not asked, or did not answer. This is **not** the same as "cannot be purged", and the certificate makes no claim either way. |
+
+A USB-attached disk is always reported as not available, and is never queried: a
+USB bridge does not expose the underlying ATA or NVMe feature set, so a sanitize
+command issued through one can neither be executed nor verified. Behind a RAID
+controller the query commonly fails, and the certificate says so and suggests
+AHCI mode; it does not silently report the drive as incapable.
+
 **Verification is part of the standard, not an extra.** Section 4.7 of
 SP 800-88 Rev.1 requires that sanitization results be verified, so EraseDrive
 samples sectors afterwards and checks them against the byte the erase actually

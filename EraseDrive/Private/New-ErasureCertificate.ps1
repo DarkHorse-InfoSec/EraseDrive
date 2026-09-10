@@ -107,7 +107,13 @@ function New-ErasureCertificate {
 
         [string]$OperatorName = "$env:USERDOMAIN\$env:USERNAME",
 
-        [string]$AdditionalNotes
+        [string]$AdditionalNotes,
+
+        # Output of Get-DiskSanitizeCapability. Optional: when absent the
+        # certificate falls back to a generic statement about Purge, because
+        # saying nothing is better than implying a device-specific finding that
+        # was never made.
+        [PSCustomObject]$SanitizeCapability
     )
 
     $certId    = [guid]::NewGuid()
@@ -242,8 +248,50 @@ function New-ErasureCertificate {
             [void]$sb.AppendLine('This erasure meets NIST SP 800-88 Rev.1 Clear: every addressable')
             [void]$sb.AppendLine('location was overwritten and the result was verified by sampling')
             [void]$sb.AppendLine('per section 4.7.')
-            [void]$sb.AppendLine('For SSD Purge-level assurance, the drive vendor''s own sanitize or')
-            [void]$sb.AppendLine('cryptographic-erase command is required in addition to this process.')
+            [void]$sb.AppendLine()
+
+            # Purge is a separate claim from Clear and must never be implied by
+            # it. Every branch below states explicitly that Purge was NOT
+            # performed, because this tool does not yet issue a sanitize command.
+            if ($null -eq $SanitizeCapability) {
+                [void]$sb.AppendLine('PURGE: not performed, and this device''s capability was not queried.')
+                [void]$sb.AppendLine('For SSD Purge-level assurance, the drive vendor''s own sanitize or')
+                [void]$sb.AppendLine('cryptographic-erase command is required in addition to this process.')
+            }
+            elseif ($null -eq $SanitizeCapability.PurgeCapable) {
+                [void]$sb.AppendLine('PURGE: not performed. This device''s Purge capability is UNKNOWN;')
+                [void]$sb.AppendLine('it could not be determined, which is NOT the same as absent. No')
+                [void]$sb.AppendLine('claim is made either way.')
+                if ($SanitizeCapability.Blockers) {
+                    foreach ($blocker in $SanitizeCapability.Blockers) {
+                        [void]$sb.AppendLine("  Reason: $blocker")
+                    }
+                }
+            }
+            elseif ($SanitizeCapability.PurgeCapable) {
+                [void]$sb.AppendLine('PURGE: AVAILABLE ON THIS DEVICE BUT NOT PERFORMED.')
+                [void]$sb.AppendLine('The device reports support for:')
+                foreach ($method in $SanitizeCapability.PurgeMethods) {
+                    [void]$sb.AppendLine("  - $method")
+                }
+                [void]$sb.AppendLine('Reaching NIST SP 800-88 Rev.1 Purge requires issuing one of those')
+                [void]$sb.AppendLine('commands. This tool does not issue them, so Purge was NOT achieved.')
+                [void]$sb.AppendLine('On flash media, overwriting cannot reach Purge at any number of')
+                [void]$sb.AppendLine('passes: the flash translation layer keeps over-provisioned, retired')
+                [void]$sb.AppendLine('and un-erased blocks outside the addressable LBA range.')
+                foreach ($blocker in $SanitizeCapability.Blockers) {
+                    [void]$sb.AppendLine("  Note: $blocker")
+                }
+            }
+            else {
+                [void]$sb.AppendLine('PURGE: not available on this device, and not performed.')
+                foreach ($blocker in $SanitizeCapability.Blockers) {
+                    [void]$sb.AppendLine("  Reason: $blocker")
+                }
+                if ($SanitizeCapability.DeviceAnswered) {
+                    [void]$sb.AppendLine('  The device was queried and reported no command reaching Purge.')
+                }
+            }
         }
         [void]$sb.AppendLine()
 

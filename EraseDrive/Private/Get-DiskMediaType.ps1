@@ -32,7 +32,9 @@ function Get-DiskMediaType {
     .OUTPUTS
         PSCustomObject with properties:
             MediaType           [string] - 'SSD', 'HDD', or 'Unknown'
-            SupportsSecureErase [bool]   - Whether ATA Secure Erase or NVMe Format is available.
+            SupportsSecureErase [bool?]  - Whether the DEVICE reports a command reaching
+                                           NIST Purge. Three-state: $true, $false, or $null
+                                           when it could not be determined.
             SupportsTrim        [bool]   - Whether TRIM/Unmap is supported.
             Protocol            [string] - 'NVMe', 'SATA', 'SAS', 'USB', or 'Unknown'
     #>
@@ -44,7 +46,10 @@ function Get-DiskMediaType {
 
     # Defaults
     $mediaType = 'Unknown'
-    $supportsSecureErase = $false
+    # $null, not $false: absent a query this is UNKNOWN, and saying "false" would
+    # be the same unearned claim in the opposite direction.
+    $supportsSecureErase = $null
+    $sanitizeCapability = $null
     $supportsTrim = $false
     $protocol = 'Unknown'
 
@@ -72,16 +77,23 @@ function Get-DiskMediaType {
                 default  { 'Unknown' }
             }
 
-            # Determine secure erase support based on media type and protocol
-            # NVMe SSDs support NVMe Format (cryptographic erase)
-            # SATA SSDs support ATA Secure Erase
-            # HDDs and USB devices do not support hardware-level secure erase
-            if ($mediaType -eq 'SSD') {
-                if ($protocol -eq 'NVMe' -or $protocol -eq 'SATA') {
-                    $supportsSecureErase = $true
-                }
-            }
         }
+
+        # Hardware secure erase support is MEASURED, never inferred.
+        #
+        # This block previously read: if the media is an SSD and the bus is NVMe or
+        # SATA, set SupportsSecureErase to true. That asked the device nothing. It
+        # was written into the operation log by Invoke-SecureDiskErase, so a tool
+        # whose paid deliverable is a compliance certificate was recording a
+        # hardware capability it had never checked, in the audit trail, in a form
+        # indistinguishable from a measurement.
+        #
+        # Get-DiskSanitizeCapability asks the drive. Its answer is three-state, and
+        # $null (unknown) is preserved here rather than being flattened to $false,
+        # because "we could not determine this" and "this drive cannot do it" are
+        # different facts.
+        $sanitizeCapability = Get-DiskSanitizeCapability -DiskNumber $DiskNumber
+        $supportsSecureErase = $sanitizeCapability.PurgeCapable
 
         # Detect TRIM support via fsutil
         # fsutil behavior query disabledeletenotify returns 0 when TRIM is enabled
@@ -128,5 +140,12 @@ function Get-DiskMediaType {
         SupportsSecureErase = $supportsSecureErase
         SupportsTrim        = $supportsTrim
         Protocol            = $protocol
+
+        # The full capability record, so a caller can report WHY as well as WHAT.
+        # Measured 2026-09-10: for a disk number that does not exist this is NOT
+        # $null but a record with Determination = 'NotAttempted' and
+        # PurgeCapable = $null, because Get-DiskSanitizeCapability always returns
+        # a record. It is $null only if an exception reached the catch below.
+        SanitizeCapability  = $sanitizeCapability
     }
 }

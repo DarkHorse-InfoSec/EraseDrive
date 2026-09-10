@@ -5,7 +5,7 @@
     Author            = 'DarkHorse InfoSec'
     CompanyName       = 'DarkHorse InfoSec'
     Copyright         = '(c) 2026 DarkHorse InfoSec. Licensed under the Apache License, Version 2.0.'
-    Description       = 'Professional forensic disk and data destruction tool with NIST 800-88 compliant secure erasure, SSD-aware wiping, signed PDF Certificate of Destruction (Pro+), and tamper-evident erasure certification.'
+    Description       = 'Professional forensic disk and data destruction tool. NIST SP 800-88 Rev.1 Clear via verified multi-pass overwrite, SSD sanitization-capability detection reporting whether a device can reach Purge, signed PDF Certificate of Destruction (Pro+), and tamper-evident erasure certification.'
 
     PowerShellVersion = '5.1'
     DotNetFrameworkVersion = '4.5'

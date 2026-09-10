@@ -320,11 +320,23 @@ Describe 'Get-DiskMediaType' {
         Mock Get-Disk { $null }
         Mock Get-Partition { @() }
         Mock Write-OperationLog { }
+        # Default: no device answers. Tests that care about a specific capability
+        # override this. Without it these unit tests would issue a real IOCTL
+        # against whatever disk happens to be in the machine running them.
+        Mock Get-StorageIdentifyData { [PSCustomObject]@{ Success = $false; Data = $null; Error = 'no device in test' } }
     }
 
     It 'Returns MediaType=SSD and Protocol=NVMe for an NVMe SSD' {
         Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '0'; MediaType = 'SSD'; BusType = 'NVMe' })
+        }
+        # SupportsSecureErase is now MEASURED, so the device has to answer. This
+        # test used to pass on the bus type alone, which is the defect that
+        # Get-DiskSanitizeCapability exists to remove.
+        Mock Get-StorageIdentifyData {
+            $b = New-Object byte[] 4096
+            [BitConverter]::GetBytes([uint32]2).CopyTo($b, 328)   # SANICAP: block erase
+            [PSCustomObject]@{ Success = $true; Data = $b; Error = $null }
         }
 
         $result = Get-DiskMediaType -DiskNumber 0
@@ -332,6 +344,21 @@ Describe 'Get-DiskMediaType' {
         $result.MediaType | Should -Be 'SSD'
         $result.Protocol | Should -Be 'NVMe'
         $result.SupportsSecureErase | Should -BeTrue
+        $result.SanitizeCapability.DeviceAnswered | Should -BeTrue
+    }
+
+    It 'Reports SupportsSecureErase=$null for an NVMe SSD whose device does not answer' {
+        # The old inference returned $true here purely because it was an SSD on
+        # NVMe. Unknown must not be reported as a capability.
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
+            @([PSCustomObject]@{ DeviceId = '0'; MediaType = 'SSD'; BusType = 'NVMe' })
+        }
+        Mock Get-StorageIdentifyData { [PSCustomObject]@{ Success = $false; Data = $null; Error = 'Win32 error 1' } }
+
+        $result = Get-DiskMediaType -DiskNumber 0
+
+        $null -eq $result.SupportsSecureErase | Should -BeTrue
+        $result.SanitizeCapability.Determination | Should -Be 'QueryFailed'
     }
 
     It 'Returns MediaType=HDD and Protocol=SATA for a SATA HDD' {
@@ -339,11 +366,18 @@ Describe 'Get-DiskMediaType' {
             @([PSCustomObject]@{ DeviceId = '1'; MediaType = 'HDD'; BusType = 'SATA' })
         }
 
+        Mock Get-StorageIdentifyData {
+            # A 512-byte IDENTIFY with no capability bits set: the device answered
+            # and reported nothing, which is a genuine $false.
+            [PSCustomObject]@{ Success = $true; Data = (New-Object byte[] 512); Error = $null }
+        }
+
         $result = Get-DiskMediaType -DiskNumber 1
 
         $result.MediaType | Should -Be 'HDD'
         $result.Protocol | Should -Be 'SATA'
         $result.SupportsSecureErase | Should -BeFalse
+        $result.SanitizeCapability.DeviceAnswered | Should -BeTrue
     }
 
     It 'Returns MediaType=Unknown for Unspecified media' {
@@ -363,14 +397,24 @@ Describe 'Get-DiskMediaType' {
         $result = Get-DiskMediaType -DiskNumber 99
 
         $result.MediaType | Should -Be 'Unknown'
-        $result.SupportsSecureErase | Should -BeFalse
+        # The exception reaches the catch before any capability query runs, so
+        # this is UNKNOWN. Asserting $false here would re-enshrine the idea that
+        # an unasked device is an incapable one.
+        $null -eq $result.SupportsSecureErase | Should -BeTrue
+        $result.SanitizeCapability | Should -BeNullOrEmpty
         $result.SupportsTrim | Should -BeFalse
         $result.Protocol | Should -Be 'Unknown'
     }
 
-    It 'Detects SupportsSecureErase=$true for a SATA SSD' {
+    It 'Detects SupportsSecureErase=$true for a SATA SSD that reports SANITIZE' {
         Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '3'; MediaType = 'SSD'; BusType = 'SATA' })
+        }
+        Mock Get-StorageIdentifyData {
+            $b = New-Object byte[] 512
+            # word 59 bits 12 and 15: SANITIZE feature set + BLOCK ERASE EXT
+            [BitConverter]::GetBytes([uint16]0x9000).CopyTo($b, 118)
+            [PSCustomObject]@{ Success = $true; Data = $b; Error = $null }
         }
 
         $result = Get-DiskMediaType -DiskNumber 3
@@ -378,6 +422,7 @@ Describe 'Get-DiskMediaType' {
         $result.MediaType | Should -Be 'SSD'
         $result.Protocol | Should -Be 'SATA'
         $result.SupportsSecureErase | Should -BeTrue
+        $result.SanitizeCapability.PurgeMethods | Should -Contain 'ATA SANITIZE, BLOCK ERASE EXT'
     }
 
     It 'Maps ATA BusType to SATA protocol' {
