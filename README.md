@@ -638,12 +638,75 @@ Logs are stored in `%ProgramData%\DarkHorse\EraseDrive\EraseDrive.log` with auto
 ## Version History
 
 ### v3.1.0 (Current)
+
+**Read this first if you used v3.0.0.** That version could report a successful,
+verified erase without ever having written to the disk. If you wiped a drive with
+v3.0.0 and kept the certificate, treat that certificate as unproven and wipe the
+drive again with this version. The details are below, and they are stated plainly
+rather than buried because a disk wiper that silently does nothing is the worst
+thing this software could be.
+
+**Correctness: the erase path now actually erases**
+- Fixed: on any disk larger than 2 GB the overwrite engine threw before writing a
+  single byte, and the error handler counted the failed pass as completed and
+  returned success. A 114.6 GB drive "erased" in 6.7 seconds.
+- Fixed: buffer filling ran an interpreted per-byte loop, re-filling a buffer
+  whose contents never change. Benchmarked at 1.985s per 1 MB buffer, which is
+  64.7 hours of CPU for a 114.6 GB drive before any sector could be written.
+- Fixed: erase methods wrote patterns that verification did not check for, so
+  verification could pass against data the erase had not written.
+- Fixed: a RAW or previously-cleaned disk could not be erased at all, because
+  `Clear-Disk` throws on an uninitialized disk and that was treated as failure.
+  A brand-new drive, or any drive already cleaned by EraseDrive, was refused.
+- Fixed: certificates asserted NIST SP 800-88 compliance that had not been
+  achieved. Compliance is now asserted only for what the run actually did.
+- Verified end to end on real hardware: 123,041,963,520 bytes written in 01:28:40,
+  verification 2404 of 2404 samples clean.
+
+**Safety**
+- Added a self-erase guard. EraseDrive now resolves its own location to a disk
+  number and refuses to erase the disk it is running from, which matters most when
+  it is run from the USB stick it was deployed on.
+- The audit trail and certificate now default to the media EraseDrive was launched
+  from, rather than to the volume being wiped, so the evidence does not leave with
+  the asset.
+
+**NIST SP 800-88 capability reporting**
+- The tool now ASKS the drive what it supports, over a read-only
+  `IOCTL_STORAGE_QUERY_PROPERTY`, instead of inferring capability from the bus
+  type. The previous value was a guess recorded in the audit log in a form
+  indistinguishable from a measurement.
+- Purge capability is three-state. "Unknown" never collapses to "not supported",
+  because a driver that refuses the query and a drive that reports no qualifying
+  command are different facts.
+- Purge crediting follows the media type, per SP 800-88 Rev.1 Appendix A, which
+  gives different lists for rotational and flash media. Notably ATA SECURITY ERASE
+  UNIT is credited on a platter but NOT on flash, where the standard classes it as
+  Clear only.
+- These commands are DETECTED AND REPORTED ONLY. This version issues no sanitize
+  command and never claims Purge was performed.
+
+**Usability**
+- `-Reformat` brings the disk back as a usable NTFS volume after a successful,
+  verified erase. Off by default, and skipped with a stated reason if verification
+  did not pass.
+- The completion dialog, CLI output and result message all explain that a wiped
+  disk is left RAW on purpose, and how to bring it back.
+
+**Licensing and packaging**
 - Signed PDF Certificate of Destruction (Pro+ license tier)
 - License-key file model (RSA-2048 signed, offline validation)
 - "Load License..." button in GUI, tier badge in header
 - License tier banner in CLI startup output
-- Inno Setup-based code-signable installer (`installer/EraseDrive.iss`)
 - Pricing tiers: Free (text cert only), Pro $99 lifetime, Team $499/yr, MSP $1499/yr
+- Distributed as a module ZIP. The Inno Setup installer is deferred to v3.2:
+  an unsigned executable that destroys disks has the same profile as malware, and
+  shipping one would train sysadmins to click through the warning. Signed
+  installer or no installer.
+
+**Not in this release**
+- The device reissue wipe and the WinPE boot-media builder ship dormant and
+  unexported. They have never been executed and are not callable.
 
 ### v3.0.0
 - Complete module restructure (Public/Private function split)
