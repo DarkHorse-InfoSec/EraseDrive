@@ -14,14 +14,25 @@
 
 .PARAMETER Operation
     CLI mode only. The operation to perform:
-    - 'UserWipe'  : Forensic user data wipe (system remains bootable)
-    - 'DiskErase' : Complete disk erasure (non-system disks only)
+    - 'UserWipe'    : Forensic user data wipe (system remains bootable)
+    - 'DiskErase'   : Complete disk erasure (non-system disks only)
+    - 'ReissueWipe' : Full device reissue or resale wipe. Removes all users, network
+                      identity, credentials, shadow copies and machine history while
+                      leaving Windows installed. Runs offline from WinPE via
+                      -OfflineRoot, which is the only mode that can be complete.
+                      Exit codes: 0 complete, 2 succeeded with remnants, 1 failed.
 
 .PARAMETER DiskNumber
     CLI mode, DiskErase only. The disk number to erase.
 
 .PARAMETER Method
-    Wipe method: 'Standard' (fast) or 'Secure' (multi-pass overwrite).
+    Wipe method.
+      Quick    - removes partitioning only, writes nothing. NOT a sanitization;
+                 the data remains recoverable and no compliance claim is made.
+      Standard - removes partitioning and overwrites every sector once with zeros.
+                 NIST SP 800-88 Rev.1 Clear. This is the default.
+      Secure   - media-aware deep erase: multi-pass overwrite on rotational media,
+                 full-device zero fill on SSDs.
     Default: 'Standard'
 
 .PARAMETER ClearEventLogs
@@ -30,6 +41,18 @@
 
 .PARAMETER SkipVerification
     Skip the post-erase verification pass. Not recommended.
+
+.PARAMETER Reformat
+    CLI mode, DiskErase only. After a successful and verified erase, create a single
+    full-size partition and filesystem so the disk is usable again instead of being
+    left raw. Off by default. Ignored, with a reason logged, if -SkipVerification was
+    passed or verification did not pass.
+
+.PARAMETER ReformatFileSystem
+    Filesystem created by -Reformat: 'NTFS' (default), 'exFAT', or 'FAT32'.
+
+.PARAMETER ReformatLabel
+    Volume label applied by -Reformat. Default: 'ERASED'.
 
 .PARAMETER TimeoutMinutes
     Maximum number of minutes the operation is allowed to run. 0 (default) means no
@@ -56,6 +79,17 @@
     .\Start-EraseDrive.ps1 -Mode CLI -Operation DiskErase -DiskNumber 2 -Method Secure -Force
 
 .EXAMPLE
+    # Boot the WinPE media, then wipe the internal Windows install for reissue.
+    # This is the recommended form: nothing on the target is running, so every profile
+    # can be removed and no remnants are left behind.
+    .\Start-EraseDrive.ps1 -Mode CLI -Operation ReissueWipe -OfflineRoot C:\ -RemoveFromDomain -Method Secure -Force
+
+.EXAMPLE
+    # Live reissue wipe with sysprep, so the device boots to out-of-box setup and
+    # shuts down ready to hand to the next person.
+    .\Start-EraseDrive.ps1 -Mode CLI -Operation ReissueWipe -RemoveFromDomain -Generalize -Force
+
+.EXAMPLE
     # CLI: Secure user wipe with event log clearing
     .\Start-EraseDrive.ps1 -Mode CLI -Operation UserWipe -Method Secure -ClearEventLogs -Confirm
 
@@ -68,17 +102,48 @@ param(
     [ValidateSet('GUI', 'CLI')]
     [string]$Mode = 'GUI',
 
-    [ValidateSet('UserWipe', 'DiskErase')]
+    [ValidateSet('UserWipe', 'DiskErase', 'ReissueWipe')]
     [string]$Operation,
+
+    # ReissueWipe only. Root of an offline Windows volume when running from WinPE,
+    # for example 'C:\'. Omit to wipe the running system.
+    [string]$OfflineRoot,
+
+    # ReissueWipe only. Remove the DEVICE from its Active Directory domain. No
+    # Active Directory objects are modified; user accounts are untouched.
+    [switch]$RemoveFromDomain,
+
+    [ValidatePattern('^[A-Za-z0-9\-]{1,15}$')]
+    [string]$WorkgroupName = 'WORKGROUP',
+
+    # ReissueWipe only. Run sysprep /generalize so the device boots to out-of-box setup.
+    [switch]$Generalize,
+
+    [ValidateSet('Shutdown', 'Reboot', 'Quit')]
+    [string]$GeneralizeAction = 'Shutdown',
+
+    # Where to write the log and the certificate of destruction. Defaults to the
+    # directory this script was launched from, which on the intended deployment is
+    # the USB stick rather than the machine being wiped.
+    [string]$EvidencePath,
 
     [int]$DiskNumber = -1,
 
-    [ValidateSet('Standard', 'Secure')]
+    [ValidateSet('Quick', 'Standard', 'Secure')]
     [string]$Method = 'Standard',
 
     [switch]$ClearEventLogs,
 
     [switch]$SkipVerification,
+
+    [switch]$Reformat,
+
+    [ValidateSet('NTFS', 'exFAT', 'FAT32')]
+    [string]$ReformatFileSystem = 'NTFS',
+
+    [ValidateNotNullOrEmpty()]
+    [ValidateLength(1, 32)]
+    [string]$ReformatLabel = 'ERASED',
 
     [int]$TimeoutMinutes = 0,
 
@@ -88,6 +153,10 @@ param(
 # Import the module
 $modulePath = Join-Path $PSScriptRoot 'EraseDrive'
 Import-Module $modulePath -Force
+
+# Surface active license tier in both GUI and CLI startup paths
+$licenseAtStart = & (Get-Module EraseDrive) { Test-EraseDriveLicense -Silent }
+$tierAtStart = $licenseAtStart.Tier
 
 if ($Mode -eq 'GUI') {
     Start-EraseDriveGUI
@@ -104,9 +173,70 @@ else {
         Write-OperationLog "FORCE mode: Confirmation prompts suppressed by operator" 'INFO'
     }
 
-    Write-OperationLog "CLI mode started: Operation=$Operation, Method=$Method" 'INFO'
+    $tierBannerColor = if ($tierAtStart -eq 'Free') { 'DarkYellow' } else { 'Green' }
+    Write-Host "EraseDrive license tier: $tierAtStart" -ForegroundColor $tierBannerColor
+    if ($tierAtStart -eq 'Free') {
+        Write-Host "  (Free tier produces .txt certificates only. Upgrade at erasedrive.io for signed PDF certificates.)" -ForegroundColor DarkYellow
+    }
+
+    Write-OperationLog "CLI mode started: Operation=$Operation, Method=$Method, Tier=$tierAtStart" 'INFO'
 
     switch ($Operation) {
+        'ReissueWipe' {
+            $modeLabel = $(if ($OfflineRoot) { "OFFLINE ($OfflineRoot)" } else { 'LIVE (running system)' })
+
+            Write-Host "`n=== DEVICE REISSUE WIPE ===" -ForegroundColor Red
+            Write-Host "Mode:             $modeLabel" -ForegroundColor Yellow
+            Write-Host "Method:           $Method" -ForegroundColor Yellow
+            Write-Host "Remove from domain: $RemoveFromDomain" -ForegroundColor Yellow
+            Write-Host "Generalize:       $Generalize" -ForegroundColor Yellow
+            Write-Host ""
+
+            if (-not $OfflineRoot) {
+                Write-Host "WARNING: a live wipe cannot be complete. The operator's own profile," -ForegroundColor Yellow
+                Write-Host "         the cached domain credential store and pagefile.sys all survive." -ForegroundColor Yellow
+                Write-Host "         Boot the EraseDrive WinPE media for a full wipe." -ForegroundColor Yellow
+                Write-Host ""
+            }
+
+            $reissueArgs = @{
+                WipeMethod       = $Method
+                WorkgroupName    = $WorkgroupName
+                GeneralizeAction = $GeneralizeAction
+            }
+            if ($OfflineRoot)      { $reissueArgs['OfflineRoot'] = $OfflineRoot }
+            if ($EvidencePath)     { $reissueArgs['EvidencePath'] = $EvidencePath }
+            if ($RemoveFromDomain) { $reissueArgs['RemoveFromDomain'] = $true }
+            if ($Generalize)       { $reissueArgs['Generalize'] = $true }
+            if ($ClearEventLogs)   { $reissueArgs['ClearEventLogs'] = $true }
+
+            $result = Invoke-DeviceReissueWipe @reissueArgs
+
+            Write-Host ""
+            Write-Host $result.Message -ForegroundColor $(if ($result.Complete) { 'Green' } else { 'Yellow' })
+            Write-Host "Evidence: $($result.EvidenceRoot)" -ForegroundColor Cyan
+            if ($result.CertificatePath) {
+                Write-Host "Certificate: $($result.CertificatePath)" -ForegroundColor Cyan
+            }
+
+            if ($result.Unreachable.Count -gt 0) {
+                Write-Host ""
+                Write-Host "REMNANTS NOT REMOVED ($($result.Unreachable.Count)):" -ForegroundColor Yellow
+                $result.Unreachable | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+            }
+
+            if ($result.PendingReboot) {
+                Write-Host ""
+                Write-Host "A clean shutdown is REQUIRED before this device is handed over." -ForegroundColor Yellow
+            }
+
+            # Exit 0 only on a complete wipe. A partial wipe reported as success is how a
+            # device gets handed over with the previous user's data still on it.
+            if ($result.Success -and $result.Complete) { exit 0 }
+            elseif ($result.Success) { exit 2 }
+            else { exit 1 }
+        }
+
         'UserWipe' {
             if ($PSCmdlet.ShouldProcess('All user profiles', 'Forensic User Data Wipe')) {
                 Write-Host "`n=== FORENSIC USER DATA WIPE ===" -ForegroundColor Red
@@ -120,7 +250,13 @@ else {
                     $logPath = Join-Path $env:ProgramData 'DarkHorse\EraseDrive\EraseDrive.log'
                     Write-Host "Log: $logPath" -ForegroundColor Cyan
                     if ($result.CertificatePath) {
-                        Write-Host "Certificate: $($result.CertificatePath)" -ForegroundColor Cyan
+                        Write-Host "Certificate (TXT): $($result.CertificatePath)" -ForegroundColor Cyan
+                    }
+                    if ($result.PSObject.Properties['PdfCertificatePath'] -and $result.PdfCertificatePath) {
+                        Write-Host "Certificate (PDF): $($result.PdfCertificatePath)" -ForegroundColor Cyan
+                    }
+                    elseif ($tierAtStart -eq 'Free') {
+                        Write-Host "Free tier: no PDF certificate. Upgrade at erasedrive.io for signed PDFs." -ForegroundColor DarkYellow
                     }
                     exit 0
                 }
@@ -149,15 +285,44 @@ else {
                 Write-Host "`n=== COMPLETE DISK ERASURE ===" -ForegroundColor Red
                 Write-Host "Target: $diskDesc" -ForegroundColor Yellow
                 Write-Host "Method: $Method" -ForegroundColor Yellow
+                if ($Reformat) {
+                    Write-Host "After:  reformat as $ReformatFileSystem once the erase is verified" -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host "After:  leave the disk raw (no partitions, no drive letter)" -ForegroundColor Yellow
+                }
                 Write-Host ""
 
-                $result = Invoke-SecureDiskErase -DiskNumber $DiskNumber -EraseMethod $Method -SkipVerification:$SkipVerification -TimeoutMinutes $TimeoutMinutes
+                $result = Invoke-SecureDiskErase -DiskNumber $DiskNumber -EraseMethod $Method -SkipVerification:$SkipVerification -TimeoutMinutes $TimeoutMinutes -Reformat:$Reformat -ReformatFileSystem $ReformatFileSystem -ReformatLabel $ReformatLabel
                 if ($result.Success) {
                     Write-Host "`nErase completed successfully." -ForegroundColor Green
+                    if ($result.PSObject.Properties['Reformatted'] -and $result.Reformatted) {
+                        $letter = $result.DriveLetter
+                        if ($letter) {
+                            Write-Host "Disk reformatted and mounted as drive ${letter}:" -ForegroundColor Green
+                        }
+                        else {
+                            Write-Host "Disk reformatted. No drive letter was assigned; assign one in Disk Management." -ForegroundColor Yellow
+                        }
+                    }
+                    else {
+                        Write-Host "The disk is now RAW: no partition table, no drive letter. That is the normal" -ForegroundColor Yellow
+                        Write-Host "result of an erase, not damage. Re-run with -Reformat, or use Disk Management," -ForegroundColor Yellow
+                        Write-Host "to make it usable again." -ForegroundColor Yellow
+                        if ($result.PSObject.Properties['ReformatMessage'] -and $result.ReformatMessage) {
+                            Write-Host $result.ReformatMessage -ForegroundColor Yellow
+                        }
+                    }
                     $logPath = Join-Path $env:ProgramData 'DarkHorse\EraseDrive\EraseDrive.log'
                     Write-Host "Log: $logPath" -ForegroundColor Cyan
                     if ($result.CertificatePath) {
-                        Write-Host "Certificate: $($result.CertificatePath)" -ForegroundColor Cyan
+                        Write-Host "Certificate (TXT): $($result.CertificatePath)" -ForegroundColor Cyan
+                    }
+                    if ($result.PSObject.Properties['PdfCertificatePath'] -and $result.PdfCertificatePath) {
+                        Write-Host "Certificate (PDF): $($result.PdfCertificatePath)" -ForegroundColor Cyan
+                    }
+                    elseif ($tierAtStart -eq 'Free') {
+                        Write-Host "Free tier: no PDF certificate. Upgrade at erasedrive.io for signed PDFs." -ForegroundColor DarkYellow
                     }
                     exit 0
                 }

@@ -1,0 +1,14 @@
+# Line-ending policy. The repository stores text as LF; Windows working trees may
+# hold CRLF and git normalizes on the way in. Without this file, core.autocrlf=false
+# makes every CRLF working-tree file read as a whole-file rewrite.
+* text=auto eol=lf
+
+# Windows batch files are executed by cmd.exe and must keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets: never normalized, never diffed as text.
+*.png binary
+*.ico binary
+*.exe binary
+*.pfx binary

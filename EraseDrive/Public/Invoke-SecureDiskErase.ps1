@@ -9,7 +9,14 @@ function Invoke-SecureDiskErase {
         boot disk), then queries hardware characteristics to select the optimal erasure
         strategy.
 
-        Standard method uses Clear-Disk to remove all partition, volume, and OEM data.
+        Quick removes the partition table with Clear-Disk and writes nothing to the
+        media. It is NOT a sanitization method: the data remains on the disk and is
+        recoverable with ordinary tools. It exists for repartitioning, produces no
+        compliance claim, and is not verified.
+
+        Standard removes the partition table and then overwrites every addressable
+        sector once with zeros. That is NIST SP 800-88 Rev.1 Clear, and it is the
+        default.
 
         Secure method applies media-appropriate deep erasure:
         - HDD: Clear-Disk followed by a 3-pass overwrite of the raw physical device
@@ -21,12 +28,28 @@ function Invoke-SecureDiskErase {
         Post-erase verification samples sectors to confirm data was destroyed (unless
         -SkipVerification is specified). An erasure certificate is generated upon completion.
 
+        A successful erase removes the partition table along with the data, so the disk is
+        left RAW: no partitions, no filesystem, and no drive letter. That is the correct
+        end state for a destruction tool and the disk is not damaged. Pass -Reformat to
+        have EraseDrive create a single full-size partition and filesystem afterwards, so
+        the disk comes back usable. Reformatting runs only after both the erase and its
+        verification have succeeded; if either did not, the reformat is skipped and the
+        reason is reported in ReformatMessage.
+
     .PARAMETER DiskNumber
         The disk number to erase (as shown by Get-Disk or Disk Management).
 
     .PARAMETER EraseMethod
-        'Standard' performs a fast partition/volume removal. 'Secure' performs media-aware
-        deep erasure. Default: Standard
+        'Quick' removes partitioning only and writes nothing. NOT sanitization, and
+        it makes no compliance claim. 'Standard' (default) removes partitioning and
+        overwrites every sector once with zeros: NIST SP 800-88 Rev.1 Clear.
+        'Secure' performs media-aware deep erasure, a 3-pass overwrite on rotational
+        media or a full-device zero fill on SSDs.
+
+        Note that 'Secure' is not more NIST-compliant than 'Standard'. Both reach
+        Clear; the extra passes are there because audit checklists still ask for
+        them. Neither reaches Purge on an SSD, which needs the drive's own sanitize
+        or crypto-erase command.
 
     .PARAMETER SkipVerification
         When specified, skips the post-erase sector verification step. Not recommended
@@ -35,6 +58,28 @@ function Invoke-SecureDiskErase {
     .PARAMETER ReportProgress
         Optional scriptblock callback invoked with progress updates. Receives a hashtable
         with keys: PercentComplete (int), Status (string), CurrentOperation (string).
+
+    .PARAMETER Reformat
+        When specified, creates a single full-size partition and filesystem on the disk
+        after a successful, verified erase, so the disk is usable again instead of being
+        left RAW. Off by default: the safe end state for a destruction tool is a raw disk.
+
+        The reformat is deliberately gated. It is skipped, with a reason, when
+        -SkipVerification was passed, when verification did not pass, or when the
+        requested filesystem cannot hold the disk. A failed reformat never fails the
+        erase: the data is still destroyed and the certificate is still valid.
+
+    .PARAMETER ReformatFileSystem
+        Filesystem to create when -Reformat is specified. 'NTFS' (default), 'exFAT' for
+        cross-platform removable media, or 'FAT32' for disks of 32 GB or less.
+
+    .PARAMETER ReformatPartitionStyle
+        Partition style to initialize when -Reformat is specified. 'GPT' (default) or
+        'MBR'. MBR cannot address more than 2 TB.
+
+    .PARAMETER ReformatLabel
+        Volume label to apply when -Reformat is specified. Default: 'ERASED'. NTFS allows
+        up to 32 characters; exFAT and FAT32 allow up to 11.
 
     .PARAMETER TimeoutMinutes
         Maximum number of minutes the operation is allowed to run. 0 (default) means no
@@ -49,6 +94,9 @@ function Invoke-SecureDiskErase {
             Method          [string]   - The erase method used
             Verified        [bool]     - Whether post-erase verification passed
             CertificatePath [string]   - Path to the erasure certificate file
+            Reformatted     [bool]     - Whether a new filesystem was created afterwards
+            ReformatMessage [string]   - Outcome of the reformat, or why it was skipped
+            DriveLetter     [string]   - Drive letter assigned by the reformat, if any
             Duration        [timespan] - Total elapsed time
 
     .EXAMPLE
@@ -75,6 +123,12 @@ function Invoke-SecureDiskErase {
         Performs a secure erase of disk 3 with progress reporting.
 
     .EXAMPLE
+        Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Secure -Reformat -ReformatFileSystem exFAT -ReformatLabel 'RECOVERED'
+
+        Securely erases disk 1, verifies it, then brings it back as a single exFAT volume
+        labelled RECOVERED rather than leaving it raw.
+
+    .EXAMPLE
         Invoke-SecureDiskErase -DiskNumber 1 -WhatIf
 
         Shows what the erase operation would do without making any changes.
@@ -89,7 +143,7 @@ function Invoke-SecureDiskErase {
         [int]$DiskNumber,
 
         [Parameter()]
-        [ValidateSet('Standard', 'Secure')]
+        [ValidateSet('Quick', 'Standard', 'Secure')]
         [string]$EraseMethod = 'Standard',
 
         [Parameter()]
@@ -99,26 +153,96 @@ function Invoke-SecureDiskErase {
         [scriptblock]$ReportProgress,
 
         [Parameter()]
+        [switch]$Reformat,
+
+        [Parameter()]
+        [ValidateSet('NTFS', 'exFAT', 'FAT32')]
+        [string]$ReformatFileSystem = 'NTFS',
+
+        [Parameter()]
+        [ValidateSet('GPT', 'MBR')]
+        [string]$ReformatPartitionStyle = 'GPT',
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [ValidateLength(1, 32)]
+        [string]$ReformatLabel = 'ERASED',
+
+        [Parameter()]
         [int]$TimeoutMinutes = 0
     )
 
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $verified = $false
     $certificatePath = $null
+    $pdfCertificatePath = $null
+    $licenseTier = 'Free'
     $operationLock = $null
+    $reformatted = $false
+    $reformatMessage = $null
+    $reformatDriveLetter = $null
 
-    # Helper to invoke progress callback safely
+    # The byte this run leaves across the media, and therefore the byte verification
+    # must expect. $null means "nothing predictable was written", which is a
+    # DIFFERENT state from "zeros were written" even though 0x00 is falsy. Always
+    # compare with `$null -eq $finalPattern`; `if ($finalPattern)` is false for the
+    # commonest success case and would silently skip verification.
+    $finalPattern = $null
+
+    # Helper to invoke the caller's progress callback safely.
+    #
+    # The name here is deliberate and was learned the hard way.
+    #
+    # The callback is captured into $callerProgress, a name that exists nowhere
+    # else in this module. `$ReportProgress` is the parameter name of BOTH this
+    # function and Invoke-SecureOverwrite, and a scriptblock invoked with & from
+    # inside the other function resolves that name in the wrong scope: the
+    # caller's callback silently never fires. Reproduced in isolation before
+    # changing anything.
+    #
+    # Confirmed working in a real run after the rename: the operator sees
+    # "[ 41%] Overwriting disk - Pass 1 of 1" while the overwrite is in flight.
+    # Do not rename $callerProgress back to $ReportProgress.
+    $callerProgress = $ReportProgress
     $reportStep = {
         param([int]$Percent, [string]$Status, [string]$Operation)
-        if ($ReportProgress) {
+        if ($null -ne $callerProgress) {
             try {
-                & $ReportProgress @{
+                & $callerProgress @{
                     PercentComplete  = $Percent
                     Status           = $Status
                     CurrentOperation = $Operation
                 }
             }
             catch { }
+        }
+    }
+
+    # Clear-Disk that treats "nothing to clear" as success.
+    #
+    # Clear-Disk throws "The disk has not been initialized" on a RAW disk, and
+    # -ErrorAction Stop turned that into a failed erase. A raw disk is not an error
+    # condition here: it is a disk with no partition table, which is precisely the
+    # state Clear-Disk exists to produce. Refusing to erase one meant a brand-new
+    # disk, or any disk already cleaned by a previous EraseDrive run, could not be
+    # erased at all. Found 2026-09-10 the first time the tool was pointed at a
+    # genuinely uninitialized device.
+    #
+    # Anything OTHER than that condition is still fatal and rethrown.
+    $clearDiskTolerant = {
+        param([string]$Context)
+        try {
+            Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
+            Write-OperationLog -Message "Clear-Disk completed for disk $DiskNumber ($Context)" -LogLevel 'INFO'
+        }
+        catch {
+            $m = "$($_.Exception.Message)"
+            if ($m -match 'has not been initialized' -or $m -match 'no partitions|not contain any partitions') {
+                Write-OperationLog -Message "Clear-Disk had nothing to remove on disk $DiskNumber ($Context): the disk is already raw. Continuing." -LogLevel 'INFO'
+            }
+            else {
+                throw
+            }
         }
     }
 
@@ -146,11 +270,17 @@ function Invoke-SecureDiskErase {
                 -DiskModel $Model `
                 -DiskSizeGB $SizeGB `
                 -VerificationResult $null `
+                -SanitizeCapability $mediaInfo.SanitizeCapability `
                 -OperatorName ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
 
             if ($partialCertResult.Success) {
                 $script:certificatePath = $partialCertResult.FilePath
+                $script:pdfCertificatePath = $partialCertResult.PdfFilePath
+                $script:licenseTier = $partialCertResult.LicenseTier
                 Write-OperationLog -Message "Partial erasure certificate generated (timeout): $($partialCertResult.FilePath)" -LogLevel 'WARNING'
+                if ($partialCertResult.PdfFilePath) {
+                    Write-OperationLog -Message "Partial PDF certificate generated (timeout): $($partialCertResult.PdfFilePath)" -LogLevel 'WARNING'
+                }
             }
         }
         catch {
@@ -160,13 +290,18 @@ function Invoke-SecureDiskErase {
         $stopwatch.Stop()
 
         return [PSCustomObject]@{
-            Success         = $false
-            Message         = $timeoutMsg
-            DiskNumber      = $DiskNumber
-            Method          = $EraseMethod
-            Verified        = $false
-            CertificatePath = $script:certificatePath
-            Duration        = $stopwatch.Elapsed
+            Success            = $false
+            Message            = $timeoutMsg
+            DiskNumber         = $DiskNumber
+            Method             = $EraseMethod
+            Verified           = $false
+            CertificatePath    = $script:certificatePath
+            PdfCertificatePath = $script:pdfCertificatePath
+            LicenseTier        = $script:licenseTier
+            Reformatted        = $reformatted
+            ReformatMessage    = $reformatMessage
+            DriveLetter        = $reformatDriveLetter
+            Duration           = $stopwatch.Elapsed
         }
     }
 
@@ -177,13 +312,18 @@ function Invoke-SecureDiskErase {
         if (-not $operationLock.Acquired) {
             $stopwatch.Stop()
             return [PSCustomObject]@{
-                Success         = $false
-                Message         = $operationLock.Message
-                DiskNumber      = $DiskNumber
-                Method          = $EraseMethod
-                Verified        = $false
-                CertificatePath = $null
-                Duration        = $stopwatch.Elapsed
+                Success            = $false
+                Message            = $operationLock.Message
+                DiskNumber         = $DiskNumber
+                Method             = $EraseMethod
+                Verified           = $false
+                CertificatePath    = $null
+                PdfCertificatePath = $null
+                LicenseTier        = $licenseTier
+                Reformatted        = $reformatted
+                ReformatMessage    = $reformatMessage
+                DriveLetter        = $reformatDriveLetter
+                Duration           = $stopwatch.Elapsed
             }
         }
 
@@ -201,13 +341,18 @@ function Invoke-SecureDiskErase {
             $stopwatch.Stop()
 
             return [PSCustomObject]@{
-                Success         = $false
-                Message         = $msg
-                DiskNumber      = $DiskNumber
-                Method          = $EraseMethod
-                Verified        = $false
-                CertificatePath = $null
-                Duration        = $stopwatch.Elapsed
+                Success            = $false
+                Message            = $msg
+                DiskNumber         = $DiskNumber
+                Method             = $EraseMethod
+                Verified           = $false
+                CertificatePath    = $null
+                PdfCertificatePath = $null
+                LicenseTier        = $licenseTier
+                Reformatted        = $reformatted
+                ReformatMessage    = $reformatMessage
+                DriveLetter        = $reformatDriveLetter
+                Duration           = $stopwatch.Elapsed
             }
         }
 
@@ -240,7 +385,21 @@ function Invoke-SecureDiskErase {
         $diskDescription = "Disk $DiskNumber ($diskModel, ${diskSizeGB} GB, $mediaType/$protocol, S/N: $diskSerial)"
 
         Write-OperationLog -Message "Target: $diskDescription" -LogLevel 'INFO'
-        Write-OperationLog -Message "Disk ${DiskNumber}: MediaType=$mediaType, Protocol=$protocol, SupportsSecureErase=$($mediaInfo.SupportsSecureErase), SupportsTrim=$($mediaInfo.SupportsTrim)" -LogLevel 'INFO'
+        # SupportsSecureErase is three-state. Rendering $null as an empty string in
+        # the audit log would make "unknown" indistinguishable from "false", so it
+        # is spelled out and the determination is recorded alongside it.
+        $secureEraseText = if ($null -eq $mediaInfo.SupportsSecureErase) { 'UNKNOWN' }
+                           else { [string]$mediaInfo.SupportsSecureErase }
+        $determinationText = if ($mediaInfo.SanitizeCapability) { $mediaInfo.SanitizeCapability.Determination }
+                             else { 'NotAttempted' }
+        Write-OperationLog -Message "Disk ${DiskNumber}: MediaType=$mediaType, Protocol=$protocol, PurgeCapable=$secureEraseText (determination=$determinationText), SupportsTrim=$($mediaInfo.SupportsTrim)" -LogLevel 'INFO'
+
+        if ($mediaInfo.SanitizeCapability -and $mediaInfo.SanitizeCapability.PurgeMethods.Count -gt 0) {
+            Write-OperationLog -Message "Disk ${DiskNumber}: Purge available via $($mediaInfo.SanitizeCapability.PurgeMethods -join '; '), NOT performed by this operation." -LogLevel 'INFO'
+        }
+        foreach ($capBlocker in @($mediaInfo.SanitizeCapability.Blockers)) {
+            if ($capBlocker) { Write-OperationLog -Message "Disk ${DiskNumber}: $capBlocker" -LogLevel 'WARNING' }
+        }
 
         # ── 3. ShouldProcess confirmation ────────────────────────────────
         if (-not $PSCmdlet.ShouldProcess($diskDescription, "$EraseMethod erase (ALL DATA WILL BE DESTROYED)")) {
@@ -248,31 +407,80 @@ function Invoke-SecureDiskErase {
             Write-OperationLog -Message 'Disk erase cancelled by user.' -LogLevel 'INFO'
 
             return [PSCustomObject]@{
-                Success         = $false
-                Message         = 'Disk erase cancelled by user.'
-                DiskNumber      = $DiskNumber
-                Method          = $EraseMethod
-                Verified        = $false
-                CertificatePath = $null
-                Duration        = $stopwatch.Elapsed
+                Success            = $false
+                Message            = 'Disk erase cancelled by user.'
+                DiskNumber         = $DiskNumber
+                Method             = $EraseMethod
+                Verified           = $false
+                CertificatePath    = $null
+                PdfCertificatePath = $null
+                LicenseTier        = $licenseTier
+                Reformatted        = $reformatted
+                ReformatMessage    = $reformatMessage
+                DriveLetter        = $reformatDriveLetter
+                Duration           = $stopwatch.Elapsed
             }
         }
 
         # ── 4. Perform erasure ───────────────────────────────────────────
-        if ($EraseMethod -eq 'Standard') {
-            # ── Standard: Clear-Disk only ────────────────────────────────
+        if ($EraseMethod -eq 'Quick') {
+            # ── Quick: remove partitioning, write nothing ────────────────
+            #
+            # This leaves the user data intact and recoverable. It is offered for
+            # repartitioning, not for decommissioning, and $finalPattern stays $null
+            # so that nothing downstream can verify or certify it as sanitized.
 
-            # Timeout check before Clear-Disk
             if (& $checkTimeout) {
-                return (& $handleTimeoutAbort $diskDescription 'Standard (Clear-Disk)' $diskSerial $diskModel $diskSizeGB)
+                return (& $handleTimeoutAbort $diskDescription 'Quick (Clear-Disk, no overwrite)' $diskSerial $diskModel $diskSizeGB)
+            }
+
+            & $reportStep 10 'Removing partitions' 'Clear-Disk (Quick, no overwrite)'
+            Write-OperationLog -Message "Executing Clear-Disk for disk $DiskNumber (Quick). NOTE: Quick writes nothing to the media; data remains recoverable." -LogLevel 'WARNING'
+
+            & $assertDiskIdentity
+            & $clearDiskTolerant 'Quick'
+
+            & $reportStep 70 'Partitions removed' 'Quick finished (no data was overwritten)'
+        }
+        elseif ($EraseMethod -eq 'Standard') {
+            # ── Standard: Clear-Disk + single-pass zero fill ─────────────
+            #
+            # The single fixed-pattern pass is what makes this NIST 800-88 Clear.
+            # Before 2026-09-09 this branch ran Clear-Disk alone, wrote nothing, and
+            # then failed its own verification while the certificate claimed Clear.
+
+            if (& $checkTimeout) {
+                return (& $handleTimeoutAbort $diskDescription 'Standard (Clear-Disk + single-pass zero overwrite)' $diskSerial $diskModel $diskSizeGB)
             }
 
             & $reportStep 10 'Erasing disk' 'Clear-Disk (Standard)'
             Write-OperationLog -Message "Executing Clear-Disk for disk $DiskNumber (Standard)" -LogLevel 'INFO'
 
             & $assertDiskIdentity
-            Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
-            Write-OperationLog -Message "Clear-Disk completed for disk $DiskNumber" -LogLevel 'SUCCESS'
+            & $clearDiskTolerant 'Standard'
+
+            if (& $checkTimeout) {
+                return (& $handleTimeoutAbort $diskDescription 'Standard (Clear-Disk + single-pass zero overwrite)' $diskSerial $diskModel $diskSizeGB)
+            }
+
+            & $reportStep 20 'Overwriting disk' 'Single-pass zero overwrite of the raw device'
+            $targetPath = "\\.\PhysicalDrive$DiskNumber"
+            Write-OperationLog -Message "Starting single-pass zero overwrite on $targetPath" -LogLevel 'INFO'
+
+            & $assertDiskIdentity
+            $overwriteResult = Invoke-SecureOverwrite -TargetPath $targetPath -Passes 1 -ReportProgress {
+                param($info)
+                & $reportStep ([int](20 + ($info.PercentComplete * 0.45))) 'Overwriting disk' "Pass $($info.Pass) of $($info.TotalPasses)"
+            }
+
+            if ($overwriteResult.Success) {
+                $finalPattern = $overwriteResult.FinalPattern
+                Write-OperationLog -Message "Standard overwrite completed: $($overwriteResult.BytesOverwritten) bytes, $($overwriteResult.Duration)" -LogLevel 'SUCCESS'
+            }
+            else {
+                Write-OperationLog -Message "Standard overwrite issue: $($overwriteResult.Message)" -LogLevel 'ERROR'
+                throw "Single-pass overwrite failed: $($overwriteResult.Message)"
+            }
 
             & $reportStep 70 'Erase complete' 'Standard erase finished'
         }
@@ -291,8 +499,7 @@ function Invoke-SecureDiskErase {
                 Write-OperationLog -Message "Performing secure HDD erase on disk $DiskNumber (Clear-Disk + 3-pass overwrite)" -LogLevel 'INFO'
 
                 & $assertDiskIdentity
-                Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
-                Write-OperationLog -Message "Clear-Disk completed for HDD disk $DiskNumber" -LogLevel 'INFO'
+                & $clearDiskTolerant 'Secure HDD'
 
                 # Timeout check before Invoke-SecureOverwrite
                 if (& $checkTimeout) {
@@ -310,6 +517,7 @@ function Invoke-SecureDiskErase {
                 }
 
                 if ($overwriteResult.Success) {
+                    $finalPattern = $overwriteResult.FinalPattern
                     Write-OperationLog -Message "HDD overwrite completed: $($overwriteResult.BytesOverwritten) bytes, $($overwriteResult.PassesCompleted) passes, $($overwriteResult.Duration)" -LogLevel 'SUCCESS'
                 }
                 else {
@@ -346,6 +554,8 @@ function Invoke-SecureDiskErase {
 
                         if ($diskpartExitCode -eq 0 -and ($diskpartOutput -join "`n") -match 'succeeded') {
                             $ssdEraseSuccess = $true
+                            # 'clean all' zero-fills every sector, so the media is left at 0x00.
+                            $finalPattern = [byte]0x00
                             Write-OperationLog -Message "diskpart clean all completed successfully for SATA SSD disk $DiskNumber" -LogLevel 'SUCCESS'
                         }
                         else {
@@ -384,6 +594,8 @@ function Invoke-SecureDiskErase {
 
                         if ($diskpartExitCode -eq 0 -and ($diskpartOutput -join "`n") -match 'succeeded') {
                             $ssdEraseSuccess = $true
+                            # 'clean all' zero-fills every sector, so the media is left at 0x00.
+                            $finalPattern = [byte]0x00
                             Write-OperationLog -Message "diskpart clean all completed successfully for NVMe SSD disk $DiskNumber" -LogLevel 'SUCCESS'
                         }
                         else {
@@ -418,6 +630,8 @@ function Invoke-SecureDiskErase {
 
                         if ($diskpartExitCode -eq 0 -and ($diskpartOutput -join "`n") -match 'succeeded') {
                             $ssdEraseSuccess = $true
+                            # 'clean all' zero-fills every sector, so the media is left at 0x00.
+                            $finalPattern = [byte]0x00
                             Write-OperationLog -Message "diskpart clean all completed for $protocol SSD disk $DiskNumber" -LogLevel 'SUCCESS'
                         }
                         else {
@@ -445,8 +659,7 @@ function Invoke-SecureDiskErase {
                     & $reportStep 30 'Fallback: Clear-Disk' 'SSD diskpart failed - falling back to Clear-Disk + overwrite'
 
                     & $assertDiskIdentity
-                    Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
-                    Write-OperationLog -Message "Fallback Clear-Disk completed for SSD disk $DiskNumber" -LogLevel 'INFO'
+                    & $clearDiskTolerant 'Secure SSD fallback'
 
                     # Timeout check before fallback Invoke-SecureOverwrite
                     if (& $checkTimeout) {
@@ -463,6 +676,7 @@ function Invoke-SecureDiskErase {
                     }
 
                     if ($overwriteResult.Success) {
+                        $finalPattern = $overwriteResult.FinalPattern
                         Write-OperationLog -Message "Fallback SSD overwrite completed: $($overwriteResult.BytesOverwritten) bytes, $($overwriteResult.Duration)" -LogLevel 'WARNING'
                     }
                     else {
@@ -485,28 +699,206 @@ function Invoke-SecureDiskErase {
                 return (& $handleTimeoutAbort $diskDescription $EraseMethod $diskSerial $diskModel $diskSizeGB)
             }
 
-            & $reportStep 75 'Verifying erasure' 'Post-erase sector sampling'
-            Write-OperationLog -Message "Starting post-erase verification for disk $DiskNumber" -LogLevel 'INFO'
-
-            try {
-                $verificationResult = Test-EraseVerification -DiskNumber $DiskNumber
-
-                if ($verificationResult.Verified) {
-                    $verified = $true
-                    Write-OperationLog -Message "Verification PASSED: $($verificationResult.SamplesPassed)/$($verificationResult.SamplesChecked) samples clean ($($verificationResult.Duration))" -LogLevel 'SUCCESS'
+            # `$null -eq` and not `-not $finalPattern`: a legitimate pattern of
+            # 0x00 is the commonest outcome and is falsy, so a truthiness test here
+            # would skip verification on exactly the runs that most need it.
+            if ($null -eq $finalPattern) {
+                $verificationSkipReason = if ($EraseMethod -eq 'Quick') {
+                    'Verification skipped: Quick writes nothing to the media, so there is no pattern to verify and nothing was sanitized.'
                 }
                 else {
-                    Write-OperationLog -Message "Verification FAILED: $($verificationResult.SamplesFailed)/$($verificationResult.SamplesChecked) samples still contain data. $($verificationResult.Message)" -LogLevel 'WARNING'
+                    'Verification skipped: the erase did not leave a predictable pattern on the media (an incomplete pass, or a random final pass), so sampling cannot confirm it.'
                 }
+                Write-OperationLog -Message $verificationSkipReason -LogLevel 'WARNING'
+                & $reportStep 85 'Verification skipped' $verificationSkipReason
             }
-            catch {
-                Write-OperationLog -Message "Verification error: $($_.Exception.Message)" -LogLevel 'WARNING'
-            }
+            else {
 
-            & $reportStep 85 'Verification complete' $(if ($verified) { 'Erase verified' } else { 'Verification did not pass' })
+                & $reportStep 75 'Verifying erasure' 'Post-erase sector sampling'
+                Write-OperationLog -Message "Starting post-erase verification for disk $DiskNumber against expected byte 0x$($finalPattern.ToString('X2'))" -LogLevel 'INFO'
+
+                try {
+                    # The expected pattern is not a constant here. It is the byte the
+                    # erase actually wrote, carried through from the method that wrote
+                    # it. Hardcoding 0x00 at this call site while a method wrote
+                    # something else is the defect this parameter exists to prevent.
+                    $verificationResult = Test-EraseVerification -DiskNumber $DiskNumber -ExpectedPattern $finalPattern
+
+                    if ($verificationResult.Verified) {
+                        $verified = $true
+                        Write-OperationLog -Message "Verification PASSED: $($verificationResult.SamplesPassed)/$($verificationResult.SamplesChecked) samples clean ($($verificationResult.Duration))" -LogLevel 'SUCCESS'
+                    }
+                    else {
+                        Write-OperationLog -Message "Verification FAILED: $($verificationResult.SamplesFailed)/$($verificationResult.SamplesChecked) samples still contain data. $($verificationResult.Message)" -LogLevel 'WARNING'
+                    }
+                }
+                catch {
+                    Write-OperationLog -Message "Verification error: $($_.Exception.Message)" -LogLevel 'WARNING'
+                }
+
+                & $reportStep 85 'Verification complete' $(if ($verified) { 'Erase verified' } else { 'Verification did not pass' })
+
+            }
         }
         else {
             Write-OperationLog -Message 'Post-erase verification skipped by user request.' -LogLevel 'INFO'
+        }
+
+        # ── 5b. Optional reformat, only after a verified erase ──────────
+        #
+        # A finished erase leaves the disk RAW. That is correct for a destruction
+        # tool, but an operator who does not know that reads a disk with no drive
+        # letter as a broken disk. -Reformat brings it back, and is gated so that a
+        # filesystem is never written over a disk we have not confirmed to be clean:
+        # doing so would bury any residual data under a fresh directory structure
+        # and make it harder for a later audit to find.
+        if ($Reformat) {
+            & $reportStep 87 'Reformatting' 'Creating a new partition and filesystem'
+
+            if ($SkipVerification) {
+                $reformatMessage = 'Reformat skipped: -SkipVerification was specified, so the erase was never verified. EraseDrive does not write a filesystem onto a disk it has not confirmed to be clean.'
+                Write-OperationLog -Message $reformatMessage -LogLevel 'WARNING'
+            }
+            elseif (-not $verified) {
+                $reformatMessage = 'Reformat skipped: post-erase verification did not pass, so residual data may remain. Writing a filesystem now would make that data harder to detect.'
+                Write-OperationLog -Message $reformatMessage -LogLevel 'WARNING'
+            }
+            elseif (& $checkTimeout) {
+                $reformatMessage = "Reformat skipped: the operation reached its $TimeoutMinutes minute timeout after the erase finished. The erase and its verification are unaffected."
+                Write-OperationLog -Message $reformatMessage -LogLevel 'WARNING'
+            }
+            elseif ($ReformatFileSystem -eq 'FAT32' -and $diskSizeGB -gt 32) {
+                $reformatMessage = "Reformat skipped: FAT32 cannot address this ${diskSizeGB} GB disk (Windows caps FAT32 volumes at 32 GB). Re-run with -ReformatFileSystem exFAT or NTFS."
+                Write-OperationLog -Message $reformatMessage -LogLevel 'WARNING'
+            }
+            elseif ($ReformatPartitionStyle -eq 'MBR' -and $diskSizeGB -gt 2048) {
+                $reformatMessage = "Reformat skipped: MBR cannot address this ${diskSizeGB} GB disk (MBR is limited to 2 TB). Re-run with -ReformatPartitionStyle GPT."
+                Write-OperationLog -Message $reformatMessage -LogLevel 'WARNING'
+            }
+            elseif ($ReformatFileSystem -ne 'NTFS' -and $ReformatLabel.Length -gt 11) {
+                $reformatMessage = "Reformat skipped: the label '$ReformatLabel' is $($ReformatLabel.Length) characters, and $ReformatFileSystem volumes allow at most 11."
+                Write-OperationLog -Message $reformatMessage -LogLevel 'WARNING'
+            }
+            else {
+                try {
+                    # The disk identity was pinned before the erase. Re-check it before
+                    # writing anything back, exactly as every destructive step does: a
+                    # hot-plug between erase and reformat would format a different disk.
+                    & $assertDiskIdentity
+
+                    # Do NOT trust the partition layout Windows reports here.
+                    #
+                    # The erase just wrote zeros over every sector, sector 0
+                    # included. A fully zeroed sector 0 has no 55 AA signature, so
+                    # Windows falls back to superfloppy detection and invents a
+                    # whole-disk volume. Measured on a 114.6 GB stick: it came back
+                    # as PartitionStyle MBR with a FAT16 partition of the full disk
+                    # at offset 0 and LargestFreeExtent of 0.
+                    #
+                    # Two things were tried against that real state and FAILED:
+                    #   - skipping initialization because it "already" had a style,
+                    #     which made New-Partition die with "Not enough available
+                    #     capacity";
+                    #   - Clear-Disk, which cannot remove a partition that does not
+                    #     really exist, then Initialize-Disk refusing with "The disk
+                    #     has already been initialized".
+                    #
+                    # What works is diskpart: `clean` plus `convert`, which WRITES a
+                    # real partition table rather than asking the partition API to
+                    # delete an imaginary one. This module already shells to diskpart
+                    # for the SSD secure-erase paths, so it is not a new dependency.
+                    try { Update-HostStorageCache -ErrorAction Stop }
+                    catch { Write-OperationLog -Message "Could not refresh the storage cache before reformat: $($_.Exception.Message)" -LogLevel 'WARNING' }
+
+                    $layout = Get-Disk -Number $DiskNumber -ErrorAction Stop
+                    Write-OperationLog -Message "Disk $DiskNumber after overwrite: style '$($layout.PartitionStyle)', largest free extent $($layout.LargestFreeExtent) bytes." -LogLevel 'INFO'
+
+                    if ("$($layout.PartitionStyle)" -eq 'RAW') {
+                        & $assertDiskIdentity
+                        Write-OperationLog -Message "Initializing disk $DiskNumber as $ReformatPartitionStyle" -LogLevel 'INFO'
+                        Initialize-Disk -Number $DiskNumber -PartitionStyle $ReformatPartitionStyle -Confirm:$false -ErrorAction Stop
+                        try { Update-HostStorageCache -ErrorAction Stop } catch { }
+                        $layout = Get-Disk -Number $DiskNumber -ErrorAction Stop
+                    }
+
+                    if ($layout.LargestFreeExtent -le 0) {
+                        # A disk that claims a style but offers no free extent is the
+                        # phantom. Break it with diskpart.
+                        Write-OperationLog -Message "Disk $DiskNumber reports style '$($layout.PartitionStyle)' with no free extent; rewriting the partition table with diskpart clean + convert $ReformatPartitionStyle." -LogLevel 'WARNING'
+
+                        # diskpart selects by NUMBER, so re-assert identity in the
+                        # smallest possible window before handing over.
+                        & $assertDiskIdentity
+
+                        $dpScript = Join-Path $env:TEMP "reformat_disk_$DiskNumber.txt"
+                        @(
+                            "select disk $DiskNumber"
+                            'clean'
+                            "convert $($ReformatPartitionStyle.ToLower())"
+                        ) | Set-Content -Path $dpScript -Encoding ASCII -Force
+
+                        $dpOut = & diskpart /s $dpScript 2>&1
+                        $dpCode = $LASTEXITCODE
+                        Remove-Item $dpScript -Force -ErrorAction SilentlyContinue
+
+                        if ($dpCode -ne 0) {
+                            throw "diskpart could not rewrite the partition table (exit $dpCode): $(($dpOut -join ' ').Trim())"
+                        }
+                        Write-OperationLog -Message "diskpart rewrote the partition table on disk $DiskNumber" -LogLevel 'INFO'
+
+                        Start-Sleep -Seconds 2
+                        try { Update-HostStorageCache -ErrorAction Stop } catch { }
+
+                        # The identity check after diskpart is not optional: it is the
+                        # only thing that catches a disk number having shifted while
+                        # diskpart held the device.
+                        & $assertDiskIdentity
+                        $layout = Get-Disk -Number $DiskNumber -ErrorAction Stop
+                    }
+
+                    if ($layout.LargestFreeExtent -le 0) {
+                        throw "the disk still reports no free extent after being reinitialized (style '$($layout.PartitionStyle)', allocated $($layout.AllocatedSize) of $($layout.Size) bytes), so no partition can be created."
+                    }
+
+                    & $assertDiskIdentity
+                    Write-OperationLog -Message "Creating a full-size partition on disk $DiskNumber" -LogLevel 'INFO'
+                    $newPartition = New-Partition -DiskNumber $DiskNumber -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
+
+                    # New-Partition returns the drive letter as a char, and it can come
+                    # back unset if Windows has not settled yet, so re-read it. Format by
+                    # letter rather than by partition object: -DriveLetter takes a char,
+                    # where -Partition takes a live CimInstance that nothing but the real
+                    # Storage stack can produce.
+                    $reformatDriveLetter = "$($newPartition.DriveLetter)".Trim([char]0, ' ')
+                    if ([string]::IsNullOrWhiteSpace($reformatDriveLetter)) {
+                        $settled = Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue |
+                            Where-Object { $_.DriveLetter } |
+                            Select-Object -First 1
+                        if ($settled) { $reformatDriveLetter = "$($settled.DriveLetter)".Trim([char]0, ' ') }
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($reformatDriveLetter)) {
+                        throw 'the new partition was created but Windows assigned it no drive letter, so it could not be formatted. Assign a letter to it in Disk Management and format it there.'
+                    }
+
+                    & $assertDiskIdentity
+                    & $reportStep 88 'Reformatting' "Formatting drive ${reformatDriveLetter}: as $ReformatFileSystem"
+                    $null = Format-Volume -DriveLetter $reformatDriveLetter -FileSystem $ReformatFileSystem -NewFileSystemLabel $ReformatLabel -Confirm:$false -Force -ErrorAction Stop
+
+                    $reformatted = $true
+                    $reformatMessage = "Disk reformatted as $ReformatFileSystem ($ReformatPartitionStyle), label '$ReformatLabel', mounted as drive ${reformatDriveLetter}:."
+                    Write-OperationLog -Message $reformatMessage -LogLevel 'SUCCESS'
+                }
+                catch {
+                    # The erase succeeded and was verified. A reformat failure is a
+                    # degraded outcome, not a failed erase, so it must not flip Success.
+                    # Clear the drive letter: reporting one alongside Reformatted=$false
+                    # would suggest a usable volume that does not exist.
+                    $reformatDriveLetter = $null
+                    $reformatMessage = "Reformat failed after a successful, verified erase: $($_.Exception.Message) The data is destroyed and the certificate is valid; the disk itself is unharmed."
+                    Write-OperationLog -Message $reformatMessage -LogLevel 'WARNING'
+                }
+            }
         }
 
         # ── 6. Generate erasure certificate ──────────────────────────────
@@ -514,13 +906,22 @@ function Invoke-SecureDiskErase {
 
         try {
             $methodDescription = switch ($EraseMethod) {
-                'Standard' { 'Standard (Clear-Disk)' }
+                'Quick'    { 'Quick (Clear-Disk only, NO overwrite, NOT a sanitization method)' }
+                'Standard' { 'Standard (Clear-Disk + single-pass zero overwrite)' }
                 'Secure' {
                     if ($mediaType -eq 'SSD' -and $protocol -eq 'NVMe') { 'Secure (NVMe diskpart clean all)' }
                     elseif ($mediaType -eq 'SSD' -and $protocol -eq 'SATA') { 'Secure (SATA diskpart clean all)' }
                     elseif ($mediaType -eq 'SSD') { "Secure (SSD diskpart clean all, $protocol)" }
                     else { 'Secure (Clear-Disk + 3-pass overwrite)' }
                 }
+            }
+
+            if ($reformatted) {
+                # The certificate attests to what was destroyed. The verification result
+                # it carries was captured before the reformat, so it stays truthful, but
+                # an auditor who finds a live filesystem on a "destroyed" disk needs to
+                # see that EraseDrive put it there, and when.
+                $methodDescription = "$methodDescription; reformatted as $ReformatFileSystem after verification"
             }
 
             $certResult = New-ErasureCertificate `
@@ -531,12 +932,15 @@ function Invoke-SecureDiskErase {
                 -DiskModel $diskModel `
                 -DiskSizeGB $diskSizeGB `
                 -VerificationResult $verificationResult `
+                -SanitizeCapability $mediaInfo.SanitizeCapability `
                 -OperatorName ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
 
             if ($certResult.Success) {
                 $certificatePath = $certResult.FilePath
+                $pdfCertificatePath = $certResult.PdfFilePath
+                $licenseTier = $certResult.LicenseTier
                 Write-OperationLog -Message "Erasure certificate generated: $certificatePath (ID: $($certResult.CertificateId))" -LogLevel 'SUCCESS'
-                Write-AuditLog -EventType 'CertificateGenerated' -Message "Certificate ID: $($certResult.CertificateId), Path: $certificatePath" -TargetDescription "Disk $DiskNumber"
+                Write-AuditLog -EventType 'CertificateGenerated' -Message "Certificate ID: $($certResult.CertificateId), Path: $certificatePath, PDF: $pdfCertificatePath, Tier: $licenseTier" -TargetDescription "Disk $DiskNumber"
             }
             else {
                 Write-OperationLog -Message 'Failed to generate erasure certificate.' -LogLevel 'WARNING'
@@ -551,17 +955,31 @@ function Invoke-SecureDiskErase {
         & $reportStep 100 'Complete' 'Disk erase finished'
 
         $message = "Disk $DiskNumber ($diskModel, $diskSizeGB GB) erased successfully using $EraseMethod method ($mediaType/$protocol). Verified: $verified."
+        if ($EraseMethod -eq 'Quick') {
+            $message = "$message WARNING: Quick removed the partition table only. No data was overwritten and the contents remain recoverable. This is not a sanitization and carries no compliance claim."
+        }
+        if ($reformatMessage) {
+            $message = "$message $reformatMessage"
+        }
+        elseif (-not $Reformat) {
+            $message = "$message The disk was left raw (no partitions, no drive letter), which is the normal result of an erase."
+        }
         Write-OperationLog -Message $message -LogLevel 'SUCCESS'
         Write-AuditLog -EventType 'OperationCompleted' -Message $message -TargetDescription "Disk $DiskNumber"
 
         [PSCustomObject]@{
-            Success         = $true
-            Message         = $message
-            DiskNumber      = $DiskNumber
-            Method          = $EraseMethod
-            Verified        = $verified
-            CertificatePath = $certificatePath
-            Duration        = $stopwatch.Elapsed
+            Success            = $true
+            Message            = $message
+            DiskNumber         = $DiskNumber
+            Method             = $EraseMethod
+            Verified           = $verified
+            CertificatePath    = $certificatePath
+            PdfCertificatePath = $pdfCertificatePath
+            LicenseTier        = $licenseTier
+            Reformatted        = $reformatted
+            ReformatMessage    = $reformatMessage
+            DriveLetter        = $reformatDriveLetter
+            Duration           = $stopwatch.Elapsed
         }
     }
     catch {
@@ -571,13 +989,18 @@ function Invoke-SecureDiskErase {
         Write-AuditLog -EventType 'OperationFailed' -Message $errorMessage -TargetDescription "Disk $DiskNumber"
 
         [PSCustomObject]@{
-            Success         = $false
-            Message         = $errorMessage
-            DiskNumber      = $DiskNumber
-            Method          = $EraseMethod
-            Verified        = $false
-            CertificatePath = $null
-            Duration        = $stopwatch.Elapsed
+            Success            = $false
+            Message            = $errorMessage
+            DiskNumber         = $DiskNumber
+            Method             = $EraseMethod
+            Verified           = $false
+            CertificatePath    = $null
+            PdfCertificatePath = $null
+            LicenseTier        = $licenseTier
+            Reformatted        = $reformatted
+            ReformatMessage    = $reformatMessage
+            DriveLetter        = $reformatDriveLetter
+            Duration           = $stopwatch.Elapsed
         }
     }
     finally {

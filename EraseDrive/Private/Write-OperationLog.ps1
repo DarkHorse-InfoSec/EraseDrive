@@ -78,8 +78,29 @@ function Write-OperationLog {
             }
         }
 
-        # Write the log entry
-        Add-Content -Path $logFile -Value $logEntry -ErrorAction SilentlyContinue
+        # Write the log entry.
+        #
+        # Logging must never break an erase, so this does not throw. But it must not
+        # be SILENT either: on 2026-09-09 every append failed for ninety minutes
+        # while console output continued and looked perfectly healthy, and nothing
+        # anywhere said the audit trail had stopped. For a tool whose paid
+        # deliverable is an audit document, that is the worst possible failure mode.
+        # Record it once, so a caller can report it and an operator can see it.
+        try {
+            Add-Content -Path $logFile -Value $logEntry -ErrorAction Stop
+            $Script:EraseDriveLogWriteOk = $true
+        }
+        catch {
+            if (-not $Script:EraseDriveLogWriteFailed) {
+                # Announce the first failure only. Repeating it per line would bury
+                # the operation output it is warning about.
+                $Script:EraseDriveLogWriteFailed = $true
+                $Script:EraseDriveLogWriteError  = $_.Exception.Message
+                Write-Host ("[LOGGING FAILURE] Could not write to '$logFile': " +
+                            "$($_.Exception.Message) The operation continues, but the " +
+                            'audit log is NOT being recorded from this point.') -ForegroundColor Red
+            }
+        }
 
         # Console output with color coding
         $color = switch ($LogLevel) {

@@ -19,11 +19,13 @@ BeforeAll {
     # Set up module config in script scope so functions can find it
     $Script:EraseDriveConfig = @{
         LogDirectory  = Join-Path $TestDrive 'Logs'
-        LogFile       = Join-Path $TestDrive 'Logs' 'EraseDrive.log'
+        LogFile       = Join-Path (Join-Path $TestDrive 'Logs') 'EraseDrive.log'
         CertDirectory = Join-Path $TestDrive 'Certs'
+        LicensePath   = Join-Path $TestDrive 'license.lic'
+        PublicKeyPath = Join-Path $TestDrive 'public-key-that-does-not-exist.xml'
         MaxLogSizeMB  = 1
         MaxLogFiles   = 3
-        Version       = '3.0.0'
+        Version       = '3.1.0'
     }
 
     New-Item -Path $Script:EraseDriveConfig.LogDirectory -ItemType Directory -Force | Out-Null
@@ -46,7 +48,7 @@ Describe 'Module Structure' {
 
     It 'Has a valid module manifest' {
         $manifest | Should -Not -BeNullOrEmpty
-        $manifest.Version.ToString() | Should -Be '3.0.0'
+        $manifest.Version.ToString() | Should -Be '3.1.0'
     }
 
     It 'Has the root module loader (EraseDrive.psm1)' {
@@ -65,7 +67,9 @@ Describe 'Module Structure' {
             'Get-DiskMediaType.ps1',
             'Invoke-SecureOverwrite.ps1',
             'Test-EraseVerification.ps1',
-            'New-ErasureCertificate.ps1'
+            'New-ErasureCertificate.ps1',
+            'Test-EraseDriveLicense.ps1',
+            'New-PdfCertificate.ps1'
         )
 
         foreach ($file in $expectedPrivate) {
@@ -89,10 +93,15 @@ Describe 'Module Structure' {
     }
 
     It 'Exports exactly the expected public functions in the manifest' {
+        # Deliberately 3, not 5. Invoke-DeviceReissueWipe and New-EraseDriveBootMedia
+        # ship in v3.1.0 but are NOT exported, because neither has ever been executed.
+        # They become public API in v3.2 once the VM and WinPE runs pass.
         $manifest.ExportedFunctions.Keys | Should -HaveCount 3
         $manifest.ExportedFunctions.Keys | Should -Contain 'Invoke-ForensicUserDataWipe'
         $manifest.ExportedFunctions.Keys | Should -Contain 'Invoke-SecureDiskErase'
         $manifest.ExportedFunctions.Keys | Should -Contain 'Start-EraseDriveGUI'
+        $manifest.ExportedFunctions.Keys | Should -Not -Contain 'Invoke-DeviceReissueWipe'
+        $manifest.ExportedFunctions.Keys | Should -Not -Contain 'New-EraseDriveBootMedia'
     }
 }
 
@@ -102,7 +111,7 @@ Describe 'Module Structure' {
 Describe 'Write-OperationLog' {
     BeforeEach {
         # Reset log file path for each test
-        $Script:EraseDriveConfig.LogFile = Join-Path $TestDrive 'Logs' 'EraseDrive.log'
+        $Script:EraseDriveConfig.LogFile = Join-Path (Join-Path $TestDrive 'Logs') 'EraseDrive.log'
         $Script:EraseDriveConfig.LogDirectory = Join-Path $TestDrive 'Logs'
         if (Test-Path $Script:EraseDriveConfig.LogFile) {
             Remove-Item $Script:EraseDriveConfig.LogFile -Force
@@ -311,11 +320,23 @@ Describe 'Get-DiskMediaType' {
         Mock Get-Disk { $null }
         Mock Get-Partition { @() }
         Mock Write-OperationLog { }
+        # Default: no device answers. Tests that care about a specific capability
+        # override this. Without it these unit tests would issue a real IOCTL
+        # against whatever disk happens to be in the machine running them.
+        Mock Get-StorageIdentifyData { [PSCustomObject]@{ Success = $false; Data = $null; Error = 'no device in test' } }
     }
 
     It 'Returns MediaType=SSD and Protocol=NVMe for an NVMe SSD' {
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '0'; MediaType = 'SSD'; BusType = 'NVMe' })
+        }
+        # SupportsSecureErase is now MEASURED, so the device has to answer. This
+        # test used to pass on the bus type alone, which is the defect that
+        # Get-DiskSanitizeCapability exists to remove.
+        Mock Get-StorageIdentifyData {
+            $b = New-Object byte[] 4096
+            [BitConverter]::GetBytes([uint32]2).CopyTo($b, 328)   # SANICAP: block erase
+            [PSCustomObject]@{ Success = $true; Data = $b; Error = $null }
         }
 
         $result = Get-DiskMediaType -DiskNumber 0
@@ -323,11 +344,32 @@ Describe 'Get-DiskMediaType' {
         $result.MediaType | Should -Be 'SSD'
         $result.Protocol | Should -Be 'NVMe'
         $result.SupportsSecureErase | Should -BeTrue
+        $result.SanitizeCapability.DeviceAnswered | Should -BeTrue
+    }
+
+    It 'Reports SupportsSecureErase=$null for an NVMe SSD whose device does not answer' {
+        # The old inference returned $true here purely because it was an SSD on
+        # NVMe. Unknown must not be reported as a capability.
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
+            @([PSCustomObject]@{ DeviceId = '0'; MediaType = 'SSD'; BusType = 'NVMe' })
+        }
+        Mock Get-StorageIdentifyData { [PSCustomObject]@{ Success = $false; Data = $null; Error = 'Win32 error 1' } }
+
+        $result = Get-DiskMediaType -DiskNumber 0
+
+        $null -eq $result.SupportsSecureErase | Should -BeTrue
+        $result.SanitizeCapability.Determination | Should -Be 'QueryFailed'
     }
 
     It 'Returns MediaType=HDD and Protocol=SATA for a SATA HDD' {
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '1'; MediaType = 'HDD'; BusType = 'SATA' })
+        }
+
+        Mock Get-StorageIdentifyData {
+            # A 512-byte IDENTIFY with no capability bits set: the device answered
+            # and reported nothing, which is a genuine $false.
+            [PSCustomObject]@{ Success = $true; Data = (New-Object byte[] 512); Error = $null }
         }
 
         $result = Get-DiskMediaType -DiskNumber 1
@@ -335,10 +377,11 @@ Describe 'Get-DiskMediaType' {
         $result.MediaType | Should -Be 'HDD'
         $result.Protocol | Should -Be 'SATA'
         $result.SupportsSecureErase | Should -BeFalse
+        $result.SanitizeCapability.DeviceAnswered | Should -BeTrue
     }
 
     It 'Returns MediaType=Unknown for Unspecified media' {
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '2'; MediaType = 'Unspecified'; BusType = 'USB' })
         }
 
@@ -349,19 +392,29 @@ Describe 'Get-DiskMediaType' {
     }
 
     It 'Returns defaults gracefully when Get-PhysicalDisk throws' {
-        Mock Get-PhysicalDisk { throw 'Access denied' }
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' { throw 'Access denied' }
 
         $result = Get-DiskMediaType -DiskNumber 99
 
         $result.MediaType | Should -Be 'Unknown'
-        $result.SupportsSecureErase | Should -BeFalse
+        # The exception reaches the catch before any capability query runs, so
+        # this is UNKNOWN. Asserting $false here would re-enshrine the idea that
+        # an unasked device is an incapable one.
+        $null -eq $result.SupportsSecureErase | Should -BeTrue
+        $result.SanitizeCapability | Should -BeNullOrEmpty
         $result.SupportsTrim | Should -BeFalse
         $result.Protocol | Should -Be 'Unknown'
     }
 
-    It 'Detects SupportsSecureErase=$true for a SATA SSD' {
-        Mock Get-PhysicalDisk {
+    It 'Detects SupportsSecureErase=$true for a SATA SSD that reports SANITIZE' {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '3'; MediaType = 'SSD'; BusType = 'SATA' })
+        }
+        Mock Get-StorageIdentifyData {
+            $b = New-Object byte[] 512
+            # word 59 bits 12 and 15: SANITIZE feature set + BLOCK ERASE EXT
+            [BitConverter]::GetBytes([uint16]0x9000).CopyTo($b, 118)
+            [PSCustomObject]@{ Success = $true; Data = $b; Error = $null }
         }
 
         $result = Get-DiskMediaType -DiskNumber 3
@@ -369,10 +422,11 @@ Describe 'Get-DiskMediaType' {
         $result.MediaType | Should -Be 'SSD'
         $result.Protocol | Should -Be 'SATA'
         $result.SupportsSecureErase | Should -BeTrue
+        $result.SanitizeCapability.PurgeMethods | Should -Contain 'ATA SANITIZE, BLOCK ERASE EXT'
     }
 
     It 'Maps ATA BusType to SATA protocol' {
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '4'; MediaType = 'HDD'; BusType = 'ATA' })
         }
 
@@ -578,7 +632,7 @@ Describe 'Invoke-ForensicUserDataWipe' {
         Mock New-ErasureCertificate {
             [PSCustomObject]@{
                 CertificateId = [guid]::NewGuid()
-                FilePath      = Join-Path $TestDrive 'Certs' 'TestCert.txt'
+                FilePath      = Join-Path (Join-Path $TestDrive 'Certs') 'TestCert.txt'
                 Success       = $true
             }
         }
@@ -590,6 +644,7 @@ Describe 'Invoke-ForensicUserDataWipe' {
                 PassesCompleted  = 1
                 Duration         = [timespan]::FromSeconds(1)
                 Message          = 'Mock overwrite complete'
+                FinalPattern     = [byte]0x00
             }
         }
     }
@@ -635,7 +690,13 @@ Describe 'Invoke-ForensicUserDataWipe' {
 
         { Invoke-ForensicUserDataWipe -WipeMethod Standard -WhatIf } | Should -Not -Throw
 
-        Should -Invoke Remove-Item -Times 0 -Scope It
+        # The evidence-root writability probe deliberately creates and deletes its
+        # own file with -WhatIf:$false, so a dry run reports the truth about the
+        # audit-trail location. Exclude only that path; every other delete must
+        # still be suppressed.
+        Should -Invoke Remove-Item -Times 0 -Scope It -ParameterFilter {
+            $LiteralPath -notlike '*.ed_write_probe_*'
+        }
         Should -Invoke Stop-Process -Times 0 -Scope It
         Should -Invoke Stop-Service -Times 0 -Scope It
         Should -Invoke Start-Process -Times 0 -Scope It
@@ -678,7 +739,7 @@ Describe 'Invoke-SecureDiskErase' {
             }
         }
 
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{
                 DeviceId     = '1'
                 SerialNumber = 'TESTSERIAL'
@@ -699,6 +760,7 @@ Describe 'Invoke-SecureDiskErase' {
                 PassesCompleted  = 3
                 Duration         = [timespan]::FromMinutes(30)
                 Message          = 'Overwrite complete'
+                FinalPattern     = [byte]0x00
             }
         }
 
@@ -717,7 +779,7 @@ Describe 'Invoke-SecureDiskErase' {
         Mock New-ErasureCertificate {
             [PSCustomObject]@{
                 CertificateId = [guid]::NewGuid()
-                FilePath      = Join-Path $TestDrive 'Certs' 'DiskCert.txt'
+                FilePath      = Join-Path (Join-Path $TestDrive 'Certs') 'DiskCert.txt'
                 Success       = $true
             }
         }
@@ -766,10 +828,13 @@ Describe 'Invoke-SecureDiskErase' {
         Should -Invoke Test-EraseVerification -Times 0 -Scope It
     }
 
-    It 'Does NOT call Test-EraseVerification for Standard erase method' {
+    It 'Calls Test-EraseVerification for Standard erase unless -SkipVerification' {
+        # Verification is gated on -SkipVerification alone, not on EraseMethod, which
+        # is what the comment-based help has always documented. This test previously
+        # asserted the opposite and had never run on PowerShell 5.1 to catch it.
         $null = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Confirm:$false
 
-        Should -Invoke Test-EraseVerification -Times 0 -Scope It
+        Should -Invoke Test-EraseVerification -Times 1 -Scope It
     }
 
     It 'Calls New-ErasureCertificate on successful erase' {
@@ -867,14 +932,39 @@ Describe 'Enter-OperationLock and Exit-OperationLock' {
     }
 
     It 'Returns Acquired=$false with a Message when another lock is already held' {
+        # A named mutex is REENTRANT for the thread that owns it, so acquiring twice
+        # on this thread returns $true both times and proves nothing. The guard
+        # exists to stop a second EraseDrive PROCESS, so contend from one. This test
+        # asserted same-thread reentrancy until 2026-09-09 and had never run.
         $firstLock = Enter-OperationLock -OperationName 'FirstOp'
 
         try {
             $firstLock.Acquired | Should -BeTrue
 
-            $secondLock = Enter-OperationLock -OperationName 'SecondOp'
+            $privateDir = Join-Path (Join-Path $PSScriptRoot '..') 'EraseDrive\Private'
+            $job = Start-Job -ScriptBlock {
+                param($dir)
+                $Script:EraseDriveConfig = @{
+                    LogDirectory = $env:TEMP
+                    LogFile      = Join-Path $env:TEMP 'EraseDrive-locktest.log'
+                    MaxLogSizeMB = 1
+                    MaxLogFiles  = 1
+                }
+                Get-ChildItem $dir -Filter '*.ps1' | ForEach-Object { . $_.FullName }
+                Enter-OperationLock -OperationName 'SecondOp'
+            } -ArgumentList $privateDir
+
+            $secondLock = $job | Wait-Job -Timeout 60 | Receive-Job
+            Remove-Job $job -Force -ErrorAction SilentlyContinue
+
+            $secondLock | Should -Not -BeNullOrEmpty
             $secondLock.Acquired | Should -BeFalse
             $secondLock.Message | Should -Not -BeNullOrEmpty
+
+            # Assert the REASON, not just the refusal. Without this a failure to load
+            # the module in the job would land in the catch block and return
+            # Acquired=$false for an entirely unrelated reason, passing this test
+            # while proving the opposite of what it claims.
             $secondLock.Message | Should -BeLike '*already running*'
         }
         finally {
@@ -1122,7 +1212,7 @@ Describe 'Test-DiskSafeToErase - Round 2 Safety Checks' {
             $Path -match ':\\Windows$' -or $Path -match ':\\Program Files$'
         }
         Mock Get-VirtualDisk { return @() }
-        Mock Get-PhysicalDisk { return @() }
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' { return @() }
     }
 
     It 'Returns Safe=$false when disk OperationalStatus is Offline' {
@@ -1159,7 +1249,7 @@ Describe 'Test-DiskSafeToErase - Round 2 Safety Checks' {
         Mock Get-VirtualDisk {
             @([PSCustomObject]@{ FriendlyName = 'StoragePool1' })
         }
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '3'; BusType = 'SATA' })
         } -ParameterFilter { $VirtualDisk -ne $null }
 
@@ -1181,7 +1271,7 @@ Describe 'Test-DiskSafeToErase - Round 2 Safety Checks' {
             }
         }
         Mock Get-VirtualDisk { return @() }
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '4'; BusType = 'Virtual' })
         }
 
@@ -1230,6 +1320,7 @@ Describe 'Invoke-SecureDiskErase - Round 2 Features' {
                 PassesCompleted  = 3
                 Duration         = [timespan]::FromMinutes(30)
                 Message          = 'Overwrite complete'
+                FinalPattern     = [byte]0x00
             }
         }
 
@@ -1248,13 +1339,13 @@ Describe 'Invoke-SecureDiskErase - Round 2 Features' {
         Mock New-ErasureCertificate {
             [PSCustomObject]@{
                 CertificateId = [guid]::NewGuid()
-                FilePath      = Join-Path $TestDrive 'Certs' 'DiskCert.txt'
+                FilePath      = Join-Path (Join-Path $TestDrive 'Certs') 'DiskCert.txt'
                 Success       = $true
             }
         }
 
         # Default: serial stays consistent across calls
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             @([PSCustomObject]@{
                 DeviceId     = '1'
                 SerialNumber = 'SERIAL_CONSISTENT'
@@ -1357,7 +1448,7 @@ Describe 'Invoke-SecureDiskErase - Round 2 Features' {
         # We need Get-PhysicalDisk to return different serials on successive calls.
 
         $script:serialCallCount = 0
-        Mock Get-PhysicalDisk {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' {
             $script:serialCallCount++
             if ($script:serialCallCount -le 2) {
                 # First two calls: pinning + disk info gathering

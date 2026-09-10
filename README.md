@@ -6,6 +6,27 @@ A professional PowerShell module for secure data destruction on Windows systems.
 
 **This tool permanently destroys data. There is no undo.** Always ensure important data is backed up before proceeding with any wipe operation. Verify you are selecting the correct target before executing.
 
+## Pricing (v3.1)
+
+EraseDrive is freemium. The wipe is always free. The signed PDF Certificate of Destruction requires a paid license.
+
+| Tier | Price       | Includes |
+|------|-------------|----------|
+| Free | $0          | Unlimited wipes. Text (.txt) certificate with HMAC-SHA256 integrity signature. |
+| Pro  | $99 once    | Lifetime. Signed PDF Certificate of Destruction. All future versions. |
+| Team | $499 / yr   | 5 technicians (honor system). All Pro features. |
+| MSP  | $1499 / yr  | Unlimited technicians, multi-tenant. All Team features. |
+
+Buy at [erasedrive.io](https://erasedrive.io) or directly via Gumroad. The license file is emailed within 24 hours of purchase.
+
+**Activating a license:**
+
+1. Save the `license.lic` you received to `%ProgramData%\DarkHorse\EraseDrive\license.lic`. You may need to create the folder if EraseDrive has never been run on this machine.
+2. (Or, in the GUI) click "LOAD LICENSE" and select your `.lic` file.
+3. The header badge changes from `TIER: FREE` to `TIER: PRO` (or Team / MSP). Future wipes generate both `.txt` and `.pdf` certificates.
+
+EraseDrive does not phone home. License validation is entirely offline: the `.lic` is RSA-signed by DarkHorse InfoSec and verified locally against an embedded public key. Safe to run on air-gapped networks.
+
 ## What's New in v3.0
 
 - **Proper PowerShell module** - Replaces the monolithic `erase_drive.ps1` with a structured `EraseDrive` module (manifest, public/private functions, Pester tests)
@@ -162,6 +183,25 @@ Run headless for automation, scripting, and MDT/SCCM task sequences.
 .\Start-EraseDrive.ps1 -Mode CLI -Operation UserWipe -Method Secure -ClearEventLogs -Confirm
 ```
 
+### Device Reissue Wipe
+
+> **Not available in v3.1.0.** The reissue wipe and the WinPE boot-media builder
+> ship in this release but are deliberately **not exported**, because neither has
+> been executed against a real machine yet. They become public API in v3.2 once
+> the offline wipe is proven end to end. Documented here so the design is
+> reviewable; the commands below will not resolve in v3.1.0.
+
+```powershell
+# Offline, from the WinPE boot stick. The complete wipe.
+.\Start-EraseDrive.ps1 -Mode CLI -Operation ReissueWipe -OfflineRoot C:\ -RemoveFromDomain -Method Secure -Force
+
+# Live, with sysprep, ready to hand over
+.\Start-EraseDrive.ps1 -Mode CLI -Operation ReissueWipe -RemoveFromDomain -Generalize -Force
+```
+
+Exit codes: `0` wipe complete, `2` succeeded but remnants remain (see the printed list),
+`1` failed. A partial wipe never exits `0`.
+
 ### Complete Disk Erasure
 
 ```powershell
@@ -176,7 +216,121 @@ Run headless for automation, scripting, and MDT/SCCM task sequences.
 
 # Quick erase, skip verification
 .\Start-EraseDrive.ps1 -Mode CLI -Operation DiskErase -DiskNumber 1 -Method Standard -SkipVerification -Force
+
+# Erase, then bring the disk back as a usable NTFS volume instead of leaving it raw
+.\Start-EraseDrive.ps1 -Mode CLI -Operation DiskErase -DiskNumber 2 -Method Secure -Force -Reformat
+
+# Same, as exFAT for a removable stick that has to work outside Windows
+.\Start-EraseDrive.ps1 -Mode CLI -Operation DiskErase -DiskNumber 2 -Method Secure -Force `
+    -Reformat -ReformatFileSystem exFAT -ReformatLabel RECOVERED
 ```
+
+### Safety: which disks EraseDrive refuses
+
+A disk erase is refused, with the reason reported, when the disk is offline, is the
+system or boot disk, reports anything other than Healthy, carries a system,
+reserved or recovery partition, holds a Windows installation or Program Files on
+any mounted volume, or is part of a Storage Space or RAID array.
+
+It is also refused when **the disk holds EraseDrive itself or the current working
+directory**. EraseDrive is designed to be run from removable media, and a plain
+data stick trips none of the checks above: it is not the system disk, not the boot
+disk, is healthy, has no `\Windows`, and has no reserved partition. Erasing it
+would destroy the running tool part way through the operation. If the tool cannot
+determine which disk it is running from, it says so in the safety reason rather
+than treating the unknown as safe.
+
+Before any destructive step, and again before each write of an optional reformat,
+the target disk's serial number is re-checked against the one recorded at the
+start. A disk that changed identity mid-operation, which is what a hot-plug looks
+like, aborts the operation rather than continuing on whatever now occupies that
+disk number.
+
+### Erase methods, and what each one actually does
+
+| Method | What it does | Compliance |
+|---|---|---|
+| `Quick` | Removes the partition table. **Writes nothing.** Data stays on the media and is recoverable with ordinary tools. | **None claimed.** Not a sanitization. |
+| `Standard` **(default)** | Removes the partition table, then overwrites every addressable sector once with zeros. | NIST SP 800-88 Rev.1 **Clear**, once verified. |
+| `Secure` | Media-aware: multi-pass overwrite on rotational media, full-device zero fill (`diskpart clean all`) on SSDs. | NIST SP 800-88 Rev.1 **Clear**, once verified. |
+
+Two things worth being clear about, because the industry is usually not:
+
+**`Secure` is not more NIST-compliant than `Standard`.** Both reach Clear. NIST
+SP 800-88 Rev.1 Appendix A states that a single overwrite pass with a fixed
+pattern hinders recovery even against laboratory techniques; the multi-pass
+zeros/ones/random sequence is DoD 5220.22-M, which NIST superseded. `Secure`
+exists because procurement and audit checklists still ask for it.
+
+**Neither reaches Purge on an SSD.** Purge needs the drive's own sanitize or
+cryptographic-erase command. Overwriting an SSD cannot reach over-provisioned or
+wear-levelled blocks. The certificate says so rather than implying otherwise.
+
+Since v3.1.0 EraseDrive **asks the drive** whether Purge is reachable, and prints
+the answer on the certificate. It does this with a read-only
+`IOCTL_STORAGE_QUERY_PROPERTY` query for the NVMe Identify Controller structure
+or the ATA IDENTIFY DEVICE response, and reports the commands the device itself
+advertises, for example:
+
+```
+PURGE: AVAILABLE ON THIS DEVICE BUT NOT PERFORMED.
+The device reports support for:
+  - NVMe Sanitize, block erase
+  - NVMe Format NVM, SES=1 user data erase
+```
+
+**Detection only. EraseDrive does not issue those commands, so it does not
+perform Purge**, and no certificate it produces claims otherwise. The query is
+strictly read-only: the device handle is opened with a desired access of zero,
+which is enough to read properties and not enough to read or write any sector.
+
+Three results are possible and they are deliberately not collapsed into two:
+
+| Report | Meaning |
+|---|---|
+| Purge **available** | The device answered and named at least one qualifying command. |
+| Purge **not available** | Either the device answered and named none, or the bus cannot carry such a command at all (USB bridges, virtual disks). |
+| Purge capability **UNKNOWN** | The device was not asked, or did not answer. This is **not** the same as "cannot be purged", and the certificate makes no claim either way. |
+
+A USB-attached disk is always reported as not available, and is never queried: a
+USB bridge does not expose the underlying ATA or NVMe feature set, so a sanitize
+command issued through one can neither be executed nor verified. Behind a RAID
+controller the query commonly fails, and the certificate says so and suggests
+AHCI mode; it does not silently report the drive as incapable.
+
+**Verification is part of the standard, not an extra.** Section 4.7 of
+SP 800-88 Rev.1 requires that sanitization results be verified, so EraseDrive
+samples sectors afterwards and checks them against the byte the erase actually
+wrote. **A certificate only asserts NIST Clear when that verification passed.**
+If the overwrite ran but was not confirmed, the certificate says
+`COMPLIANCE NOT ESTABLISHED`; if `Quick` was used, it says
+`NO COMPLIANCE CLAIM IS MADE BY THIS CERTIFICATE`.
+
+### After an erase, the disk is RAW. That is normal.
+
+Erasing removes the partition table along with the data, so a successfully erased
+disk has no filesystem and no drive letter, and will not appear in File Explorer.
+It is not damaged. This is the correct end state for a destruction tool: the
+default leaves nothing behind to be recovered from.
+
+To get a usable disk back, either:
+
+- pass `-Reformat` (CLI) or tick **Reformat disk after erase** (GUI), or
+- open Disk Management (`diskmgmt.msc`), right-click the disk, choose
+  **Initialize Disk**, then create a **New Simple Volume**.
+
+`-Reformat` is off by default and is deliberately gated. It runs only after the
+erase *and* its verification have both succeeded, so a filesystem is never written
+over a disk EraseDrive has not confirmed to be clean; doing that would bury any
+residual data under a fresh directory structure and make a later audit harder. It
+is skipped, with the reason reported in `ReformatMessage`, when `-SkipVerification`
+was used, when verification did not pass, or when the requested filesystem cannot
+address the disk (FAT32 above 32 GB, MBR above 2 TB).
+
+A failed reformat never fails the erase. The data is destroyed and the certificate
+is valid either way; the disk is simply still raw. When a reformat does happen, the
+erasure certificate records it, so an auditor who finds a live filesystem on a
+"destroyed" disk can see that EraseDrive put it there and when.
 
 ### Using the Module Directly
 
@@ -190,6 +344,12 @@ $result | Format-List
 # Complete disk erasure
 $result = Invoke-SecureDiskErase -DiskNumber 2 -EraseMethod Secure
 $result | Format-List
+
+# Erase, verify, then reformat so the disk is usable again
+$result = Invoke-SecureDiskErase -DiskNumber 2 -EraseMethod Secure -Reformat
+$result.Reformatted      # $true if a filesystem was created
+$result.DriveLetter      # the letter it was mounted as
+$result.ReformatMessage  # what happened, or why it was skipped
 
 # Check if a disk is safe (private function; use InModuleScope or call via module)
 ```
@@ -206,6 +366,89 @@ Parameters: -Mode CLI -Operation DiskErase -DiskNumber 1 -Method Secure -Force -
 The `-Force` flag suppresses interactive confirmation prompts. The script returns exit code `0` on success and `1` on failure, compatible with task sequence error handling.
 
 ## Operations
+
+### Device Reissue Wipe
+
+Returns a device to a clean state so it can be handed to a different employee or sold,
+with Windows still installed. This is the operation to use when the business has finished
+with a machine.
+
+Run it two ways, and the difference is not cosmetic:
+
+| | Offline (recommended) | Live |
+|---|---|---|
+| How | Boot the EraseDrive WinPE stick, pass `-OfflineRoot` | Run against the running Windows |
+| Every user profile removable | Yes | No, the operator's own survives |
+| Cached domain credentials (`HKLM\SECURITY`) | Yes | Only if running as SYSTEM |
+| `pagefile.sys` / `hiberfil.sys` | Deleted | Scheduled for clearing on shutdown |
+| Can be complete | Yes | No |
+
+A live wipe is convenient and is structurally incapable of being complete. It reports every
+remnant it could not remove in `Unreachable` rather than glossing over them, and the CLI
+exits `2` rather than `0` when the wipe succeeded but left remnants behind.
+
+**What it removes:**
+- All user profiles, their registry hives, and their ProfileList records
+- Cached domain logon verifiers (`NL$1`..`NL$10`) and the `NL$KM` key that decrypts them
+- Machine-wide Credential Manager vaults and Windows Hello / NGC containers
+- Volume Shadow Copies and System Restore points, which otherwise still hold the deleted data
+- `pagefile.sys`, `hiberfil.sys` and `swapfile.sys`
+- The Recycle Bin on every volume, not just the system volume
+- Saved wireless profiles, the NetworkList history, VPN phonebooks, network printers, proxy
+  and hosts entries
+- USB device history (USBSTOR, MountedDevices), Windows Timeline, `Windows.old`, Windows
+  Update and Delivery Optimization caches, cached Group Policy
+- Domain membership and the machine account secret, with `-RemoveFromDomain`
+
+**What it preserves:**
+- Windows, installed programs, and boot capability
+- **Active Directory. Nothing in this tool writes to the directory.** `-RemoveFromDomain`
+  removes the *device* from the domain. User accounts are untouched, so a departing user
+  signs in on their next machine exactly as before, and the computer object is left in
+  place for your normal stale-object cleanup.
+
+**Optional `-Generalize`** runs `sysprep /generalize /oobe` afterwards so the device boots
+to out-of-box setup like a new machine. It is opt-in because it consumes one of a limited
+number of rearms, requires the machine to be unjoined first, and fails on per-user
+provisioned Store apps. All three are checked before anything starts, and a failed check
+returns a refusal naming the reason rather than aborting part way through.
+
+```powershell
+# Recommended: boot the WinPE stick, then wipe the internal install
+Invoke-DeviceReissueWipe -OfflineRoot C:\ -RemoveFromDomain -WipeMethod Secure
+
+# Live, finishing with sysprep so it boots to OOBE and shuts down ready to hand over
+Invoke-DeviceReissueWipe -RemoveFromDomain -Generalize
+
+# Preview everything without changing anything
+Invoke-DeviceReissueWipe -OfflineRoot C:\ -WhatIf
+```
+
+### Bootable WinPE Media
+
+`New-EraseDriveBootMedia` builds the USB stick that makes an offline wipe possible.
+Requires the Windows ADK and the WinPE add-on.
+
+```powershell
+New-EraseDriveBootMedia -UsbDriveLetter E      # erases E:
+New-EraseDriveBootMedia -IsoPath D:\PE.iso     # for a VM or out-of-band management
+```
+
+The target must be removable media. A fixed disk is refused outright rather than
+confirmed, because `MakeWinPEMedia` erases the target completely.
+
+**BitLocker.** A corporate device is usually encrypted, and an encrypted volume is
+unreadable from WinPE until unlocked, so the wipe will correctly report that it found no
+Windows installation. The image ships `manage-bde` and the boot script flags locked
+volumes on startup:
+
+```
+manage-bde -unlock C: -RecoveryPassword <48-digit key>
+```
+
+**Evidence stays with you.** Logs and the Certificate of Destruction are written to the
+directory EraseDrive was launched from, which on the boot stick is the stick itself, not
+the machine being handed over. Override with `-EvidencePath`.
 
 ### Forensic User Data Wipe
 
@@ -276,7 +519,7 @@ After a Secure erase, EraseDrive performs a verification pass:
 4. Reads each 512-byte sector and compares against expected post-erase pattern (0x00)
 5. Reports pass/fail count, failed sector offsets, and coverage percentage
 
-Verification results are included in the erasure certificate. Use `-SkipVerification` to bypass (not recommended).
+Verification samples are compared against the byte the erase actually wrote, which is carried through from the method that wrote it rather than assumed. A certificate asserts NIST SP 800-88 Clear only when that verification passed. Use `-SkipVerification` to bypass (not recommended, and it also disables `-Reformat`).
 
 ## Erasure Certificates
 
@@ -394,7 +637,78 @@ Logs are stored in `%ProgramData%\DarkHorse\EraseDrive\EraseDrive.log` with auto
 
 ## Version History
 
-### v3.0.0 (Current)
+### v3.1.0 (Current)
+
+**Read this first if you used v3.0.0.** That version could report a successful,
+verified erase without ever having written to the disk. If you wiped a drive with
+v3.0.0 and kept the certificate, treat that certificate as unproven and wipe the
+drive again with this version. The details are below, and they are stated plainly
+rather than buried because a disk wiper that silently does nothing is the worst
+thing this software could be.
+
+**Correctness: the erase path now actually erases**
+- Fixed: on any disk larger than 2 GB the overwrite engine threw before writing a
+  single byte, and the error handler counted the failed pass as completed and
+  returned success. A 114.6 GB drive "erased" in 6.7 seconds.
+- Fixed: buffer filling ran an interpreted per-byte loop, re-filling a buffer
+  whose contents never change. Benchmarked at 1.985s per 1 MB buffer, which is
+  64.7 hours of CPU for a 114.6 GB drive before any sector could be written.
+- Fixed: erase methods wrote patterns that verification did not check for, so
+  verification could pass against data the erase had not written.
+- Fixed: a RAW or previously-cleaned disk could not be erased at all, because
+  `Clear-Disk` throws on an uninitialized disk and that was treated as failure.
+  A brand-new drive, or any drive already cleaned by EraseDrive, was refused.
+- Fixed: certificates asserted NIST SP 800-88 compliance that had not been
+  achieved. Compliance is now asserted only for what the run actually did.
+- Verified end to end on real hardware: 123,041,963,520 bytes written in 01:28:40,
+  verification 2404 of 2404 samples clean.
+
+**Safety**
+- Added a self-erase guard. EraseDrive now resolves its own location to a disk
+  number and refuses to erase the disk it is running from, which matters most when
+  it is run from the USB stick it was deployed on.
+- The audit trail and certificate now default to the media EraseDrive was launched
+  from, rather than to the volume being wiped, so the evidence does not leave with
+  the asset.
+
+**NIST SP 800-88 capability reporting**
+- The tool now ASKS the drive what it supports, over a read-only
+  `IOCTL_STORAGE_QUERY_PROPERTY`, instead of inferring capability from the bus
+  type. The previous value was a guess recorded in the audit log in a form
+  indistinguishable from a measurement.
+- Purge capability is three-state. "Unknown" never collapses to "not supported",
+  because a driver that refuses the query and a drive that reports no qualifying
+  command are different facts.
+- Purge crediting follows the media type, per SP 800-88 Rev.1 Appendix A, which
+  gives different lists for rotational and flash media. Notably ATA SECURITY ERASE
+  UNIT is credited on a platter but NOT on flash, where the standard classes it as
+  Clear only.
+- These commands are DETECTED AND REPORTED ONLY. This version issues no sanitize
+  command and never claims Purge was performed.
+
+**Usability**
+- `-Reformat` brings the disk back as a usable NTFS volume after a successful,
+  verified erase. Off by default, and skipped with a stated reason if verification
+  did not pass.
+- The completion dialog, CLI output and result message all explain that a wiped
+  disk is left RAW on purpose, and how to bring it back.
+
+**Licensing and packaging**
+- Signed PDF Certificate of Destruction (Pro+ license tier)
+- License-key file model (RSA-2048 signed, offline validation)
+- "Load License..." button in GUI, tier badge in header
+- License tier banner in CLI startup output
+- Pricing tiers: Free (text cert only), Pro $99 lifetime, Team $499/yr, MSP $1499/yr
+- Distributed as a module ZIP. The Inno Setup installer is deferred to v3.2:
+  an unsigned executable that destroys disks has the same profile as malware, and
+  shipping one would train sysadmins to click through the warning. Signed
+  installer or no installer.
+
+**Not in this release**
+- The device reissue wipe and the WinPE boot-media builder ship dormant and
+  unexported. They have never been executed and are not callable.
+
+### v3.0.0
 - Complete module restructure (Public/Private function split)
 - CLI automation mode with `-Force` flag for MDT/SCCM
 - SSD-aware media type and protocol detection
@@ -424,6 +738,38 @@ Logs are stored in `%ProgramData%\DarkHorse\EraseDrive\EraseDrive.log` with auto
 - Simple GUI interface
 - Administrator privilege checking
 
+## License
+
+EraseDrive is open source under the **Apache License, Version 2.0**. The full
+text is in [LICENSE](LICENSE); attribution and trademark terms are in
+[NOTICE](NOTICE).
+
+The word "license" does double duty in this project, so to be explicit about
+which is which:
+
+| | What it is | Terms |
+|---|---|---|
+| **The software** | Everything in this repository | Apache-2.0. Fork it, read it, run it, modify it, redistribute it. |
+| **An issued `.lic` file** | A signed credential tied to one purchase, unlocking the PDF Certificate of Destruction | Not open source and not redistributable. Yours to use, not to share. |
+| **The signing key** | The RSA private key behind every certificate | Not in this repository and never will be. |
+
+You can read every line before you let this near a disk, which for a tool whose
+entire job is irreversible destruction seems like the minimum.
+
+**On the paid tier and forks.** Nothing stops you removing the license check;
+it is a few lines of PowerShell and the Apache License permits it. Worth
+knowing what you get, though: the value of a Certificate of Destruction in an
+audit is not the PDF, it is that an identifiable party with a legal entity
+behind it attests to the erasure. A certificate a tool issued to itself is a
+document you wrote about yourself. If you need one that stands up to a third
+party, that is what the $99 buys.
+
+**Trademarks.** Apache-2.0 section 6 does not grant rights to the "EraseDrive"
+or "DarkHorse InfoSec" names. Derivative works are welcome, under a different
+name.
+
+---
+
 ## Legal Notice
 
 This tool is provided as-is for legitimate data destruction purposes. Users are responsible for:
@@ -438,4 +784,4 @@ This tool is provided as-is for legitimate data destruction purposes. Users are 
 
 ---
 
-**DarkHorse InfoSec** - EraseDrive v3.0.0
+**DarkHorse InfoSec** - EraseDrive v3.1.0

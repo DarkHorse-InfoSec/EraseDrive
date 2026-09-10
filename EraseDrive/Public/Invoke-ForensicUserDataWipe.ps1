@@ -80,12 +80,18 @@ function Invoke-ForensicUserDataWipe {
         [switch]$ClearEventLogs,
 
         [Parameter()]
-        [scriptblock]$ReportProgress
+        [scriptblock]$ReportProgress,
+
+        [Parameter()]
+        [string]$EvidencePath
     )
 
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $profilesRemoved = [System.Collections.Generic.List[string]]::new()
+    $profilesSkipped = [System.Collections.Generic.List[object]]::new()
     $certificatePath = $null
+    $pdfCertificatePath = $null
+    $licenseTier = 'Free'
     $operationLock = $null
 
     # Helper to invoke progress callback safely
@@ -110,115 +116,62 @@ function Invoke-ForensicUserDataWipe {
         if (-not $operationLock.Acquired) {
             $stopwatch.Stop()
             return [PSCustomObject]@{
-                Success         = $false
-                Message         = $operationLock.Message
-                ProfilesRemoved = [string[]]@()
-                CertificatePath = $null
-                Duration        = $stopwatch.Elapsed
+                Success            = $false
+                Message            = $operationLock.Message
+                ProfilesRemoved    = [string[]]@()
+                ProfilesSkipped    = @()
+                CertificatePath    = $null
+                PdfCertificatePath = $null
+                LicenseTier        = $licenseTier
+                Duration           = $stopwatch.Elapsed
             }
         }
+        # Defect D2: by default the log and the destruction certificate were written to
+        # %ProgramData% on the machine being wiped, so the audit trail left with the asset.
+        # Resolve an evidence location first, preferring the media EraseDrive was launched
+        # from, so a failure to secure the trail surfaces before anything is destroyed.
+        $evidenceLocation = Set-EraseDriveEvidenceRoot -Path $EvidencePath
+        if (-not $evidenceLocation.Success) {
+            Write-OperationLog -Message $evidenceLocation.Message -LogLevel 'ERROR'
+        }
+
         Write-OperationLog -Message "Forensic user data wipe started (Method: $WipeMethod, ClearEventLogs: $ClearEventLogs)" -LogLevel 'INFO'
         Write-AuditLog -EventType 'OperationStarted' -Message "Forensic user data wipe started (Method: $WipeMethod, ClearEventLogs: $ClearEventLogs)" -TargetDescription 'System drive user data'
         & $reportStep 0 'Initializing' 'Enumerating user profiles'
 
-        # ── 1. Enumerate non-system user profiles ──────────────────────────
-        $userProfiles = Get-CimInstance -ClassName Win32_UserProfile | Where-Object {
-            -not $_.Special -and
-            $_.LocalPath -notmatch '\\(Administrator|Guest|DefaultUser|Default|Public)$' -and
-            $null -ne $_.LocalPath -and
-            $_.LocalPath -ne "$env:SystemRoot\system32\config\systemprofile" -and
-            $_.LocalPath -ne "$env:SystemRoot\ServiceProfiles\LocalService" -and
-            $_.LocalPath -ne "$env:SystemRoot\ServiceProfiles\NetworkService"
+        # ---- 1-3. Profile removal, delegated -------------------------------
+        # Defect D1. The previous inline implementation selected every non-system profile
+        # except Administrator, Guest, Default and Public, then force-killed every process
+        # owned by those accounts. An operator signed in as anything else was in that set,
+        # so the function terminated its own PowerShell host part way through the wipe and
+        # could never delete the profile it was executing from, while still reporting
+        # success.
+        #
+        # Removal now goes through Remove-UserProfileData, which is shared with
+        # Invoke-DeviceReissueWipe. Accounts holding an active session are skipped and
+        # reported rather than targeted, so a partial wipe can no longer be mistaken for a
+        # complete one.
+        $targetContext = Get-TargetContext
+        if (-not $targetContext.Valid) {
+            throw "Could not resolve the target Windows installation: $($targetContext.Reason)"
         }
 
-        if (-not $userProfiles) {
-            Write-OperationLog -Message 'No non-system user profiles found to remove.' -LogLevel 'INFO'
+        $protectedPrincipals = Get-ProtectedSessionPrincipal -Context $targetContext
+
+        $profileResult = Remove-UserProfileData -Context $targetContext -Protected $protectedPrincipals -ReportProgress {
+            param($info)
+            & $reportStep ([int]($info.PercentComplete * 0.4)) $info.Status $info.CurrentOperation
         }
 
-        # ── 2. Kill processes owned by target users (O(n) instead of O(n*m)) ─
-        & $reportStep 5 'Stopping user processes' 'Identifying running processes'
+        foreach ($removedName in $profileResult.Removed) { $profilesRemoved.Add($removedName) }
+        foreach ($skippedProfile in $profileResult.Skipped) { $profilesSkipped.Add($skippedProfile) }
 
-        if ($userProfiles -and $PSCmdlet.ShouldProcess('User processes', 'Stop all processes owned by target users')) {
-            try {
-                $targetUserNames = $userProfiles | ForEach-Object { Split-Path $_.LocalPath -Leaf }
-                $allProcesses = Get-Process -IncludeUserName -ErrorAction SilentlyContinue
-                foreach ($proc in $allProcesses) {
-                    if ($proc.UserName) {
-                        $procUser = ($proc.UserName -split '\\')[-1]
-                        if ($procUser -in $targetUserNames) {
-                            try {
-                                $proc | Stop-Process -Force -ErrorAction SilentlyContinue
-                            }
-                            catch { }
-                        }
-                    }
-                }
-                Write-OperationLog -Message "Stopped processes for users: $($targetUserNames -join ', ')" -LogLevel 'INFO'
-            }
-            catch {
-                Write-OperationLog -Message "Warning stopping user processes: $($_.Exception.Message)" -LogLevel 'WARNING'
-            }
+        foreach ($failedProfile in $profileResult.Failed) {
+            Write-OperationLog -Message "Profile removal failed for '$($failedProfile.Name)': $($failedProfile.Reason)" -LogLevel 'ERROR'
         }
 
-        # ── 3. Remove each user profile ────────────────────────────────────
-        $profileIndex = 0
-        $profileCount = @($userProfiles).Count
-
-        foreach ($profile in $userProfiles) {
-            $profileIndex++
-            $userPath = $profile.LocalPath
-            $userName = Split-Path $userPath -Leaf
-            $userSID = $profile.SID
-            $pctBase = 10 + [int](($profileIndex / [math]::Max($profileCount, 1)) * 30)
-
-            & $reportStep $pctBase "Removing profile $profileIndex of $profileCount" $userName
-
-            if (-not $PSCmdlet.ShouldProcess("User profile: $userName ($userPath)", 'Remove')) {
-                continue
-            }
-
-            Write-OperationLog -Message "Removing user profile: $userName (SID: $userSID)" -LogLevel 'INFO'
-
-            try {
-                # Remove loaded registry hive
-                $regPath = "Registry::HKEY_USERS\$userSID"
-                if (Test-Path $regPath) {
-                    Remove-Item $regPath -Recurse -Force -ErrorAction SilentlyContinue
-                    Write-OperationLog -Message "Removed registry hive for $userName" -LogLevel 'INFO'
-                }
-
-                # Take ownership and remove profile directory
-                if (Test-Path $userPath) {
-                    takeown /f "$userPath" /r /d y 2>&1 | Out-Null
-                    icacls "$userPath" /grant administrators:F /t /c /q 2>&1 | Out-Null
-                    Remove-Item $userPath -Recurse -Force -ErrorAction SilentlyContinue
-                    Write-OperationLog -Message "Removed profile directory: $userPath" -LogLevel 'INFO'
-                }
-
-                # Remove profile registry entry from ProfileList
-                $profileListPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$userSID"
-                if (Test-Path $profileListPath) {
-                    Remove-Item $profileListPath -Force -ErrorAction SilentlyContinue
-                    Write-OperationLog -Message "Removed profile registry entry for $userName" -LogLevel 'INFO'
-                }
-
-                # Remove local user account if it exists
-                try {
-                    $localUser = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
-                    if ($localUser) {
-                        Remove-LocalUser -Name $userName -ErrorAction SilentlyContinue
-                        Write-OperationLog -Message "Removed local user account: $userName" -LogLevel 'INFO'
-                    }
-                }
-                catch {
-                    Write-OperationLog -Message "Could not remove local account (may be domain): $userName" -LogLevel 'WARNING'
-                }
-
-                $profilesRemoved.Add($userName)
-            }
-            catch {
-                Write-OperationLog -Message "Error removing profile ${userName}: $($_.Exception.Message)" -LogLevel 'ERROR'
-            }
+        if ($profilesSkipped.Count -gt 0) {
+            Write-OperationLog -Message "$($profilesSkipped.Count) profile(s) were skipped because they are in use. This wipe is NOT complete. Run EraseDrive from the WinPE media to remove every profile." -LogLevel 'WARNING'
         }
 
         # ── 4. Clean system-wide temporary locations ───────────────────────
@@ -383,8 +336,10 @@ function Invoke-ForensicUserDataWipe {
 
                 if ($certResult.Success) {
                     $certificatePath = $certResult.FilePath
+                    $pdfCertificatePath = $certResult.PdfFilePath
+                    $licenseTier = $certResult.LicenseTier
                     Write-OperationLog -Message "Erasure certificate generated: $certificatePath" -LogLevel 'SUCCESS'
-                    Write-AuditLog -EventType 'CertificateGenerated' -Message "Certificate path: $certificatePath" -TargetDescription 'System drive user data'
+                    Write-AuditLog -EventType 'CertificateGenerated' -Message "Certificate path: $certificatePath, PDF: $pdfCertificatePath, Tier: $licenseTier" -TargetDescription 'System drive user data'
                 }
             }
             catch {
@@ -396,16 +351,29 @@ function Invoke-ForensicUserDataWipe {
         $stopwatch.Stop()
         & $reportStep 100 'Complete' 'Forensic wipe finished'
 
-        $message = "Forensic user data wipe completed successfully. $($profilesRemoved.Count) profile(s) removed."
+        # "Completed successfully" with nothing removed is the same false-positive
+        # shape that let the disk erase certify a wipe it never performed. A run
+        # that skipped every profile has destroyed no user data, and the summary
+        # that ends up in front of an operator has to say so.
+        $message = "Forensic user data wipe completed. $($profilesRemoved.Count) profile(s) removed."
+        if ($profilesSkipped.Count -gt 0) {
+            $message += " $($profilesSkipped.Count) profile(s) SKIPPED and left intact: $($profilesSkipped -join ', ')."
+        }
+        if ($profilesRemoved.Count -eq 0) {
+            $message += ' WARNING: no user profiles were removed, so no user data was destroyed by this operation.'
+        }
         Write-OperationLog -Message $message -LogLevel 'SUCCESS'
         Write-AuditLog -EventType 'OperationCompleted' -Message $message -TargetDescription 'System drive user data'
 
         [PSCustomObject]@{
-            Success         = $true
-            Message         = $message
-            ProfilesRemoved = [string[]]$profilesRemoved.ToArray()
-            CertificatePath = $certificatePath
-            Duration        = $stopwatch.Elapsed
+            Success            = $true
+            Message            = $message
+            ProfilesRemoved    = [string[]]$profilesRemoved.ToArray()
+            ProfilesSkipped    = $profilesSkipped.ToArray()
+            CertificatePath    = $certificatePath
+            PdfCertificatePath = $pdfCertificatePath
+            LicenseTier        = $licenseTier
+            Duration           = $stopwatch.Elapsed
         }
     }
     catch {
@@ -415,11 +383,14 @@ function Invoke-ForensicUserDataWipe {
         Write-AuditLog -EventType 'OperationFailed' -Message $errorMessage -TargetDescription 'System drive user data'
 
         [PSCustomObject]@{
-            Success         = $false
-            Message         = $errorMessage
-            ProfilesRemoved = [string[]]$profilesRemoved.ToArray()
-            CertificatePath = $null
-            Duration        = $stopwatch.Elapsed
+            Success            = $false
+            Message            = $errorMessage
+            ProfilesRemoved    = [string[]]$profilesRemoved.ToArray()
+            ProfilesSkipped    = $profilesSkipped.ToArray()
+            CertificatePath    = $null
+            PdfCertificatePath = $null
+            LicenseTier        = $licenseTier
+            Duration           = $stopwatch.Elapsed
         }
     }
     finally {

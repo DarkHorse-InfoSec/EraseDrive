@@ -18,3 +18,26 @@ Desktop.ini
 
 # Logs (generated at runtime)
 *.log
+
+# Secrets. The license signing private key lives in a password manager and is
+# never written inside this repository; these patterns are a second line of
+# defence, not the control.
+*.key
+*.pfx
+*.p12
+*.lic
+*private*.xml
+
+# Build output
+installer/Output/
+*.exe
+
+# Evidence root. Set-EraseDriveEvidenceRoot prefers the directory the module was
+# launched from, which in a source checkout is this repository. Certificates and
+# audit logs must never be committed.
+EraseDrive-Evidence/
+dist/
+
+# Internal planning notes. Kept local, never published: they carry personal
+# contact details, internal machine paths and commercial reasoning.
+tasks/

@@ -146,7 +146,16 @@ function Test-EraseVerification {
                     $stream.Seek($offset, [System.IO.SeekOrigin]::Begin) | Out-Null
                     $bytesRead = $stream.Read($readBuffer, 0, $sectorSize)
 
-                    $match = $true
+                    # A sector that returned NO bytes is not a verified sector. The
+                    # comparison loop below runs $bytesRead times, so seeding $match
+                    # with $true made a zero-length read fall straight through to
+                    # "passed": an unreadable sector counted as proof of erasure,
+                    # which is a false negative in the one direction that matters.
+                    $match = ($bytesRead -gt 0)
+                    if ($bytesRead -le 0) {
+                        Write-OperationLog -Message "Verification read returned 0 bytes at offset $offset on ${diskPath}; counting as a FAILED sample because nothing was confirmed." -LogLevel 'Warning'
+                    }
+
                     for ($b = 0; $b -lt $bytesRead; $b++) {
                         if ($readBuffer[$b] -ne $ExpectedPattern) {
                             $match = $false

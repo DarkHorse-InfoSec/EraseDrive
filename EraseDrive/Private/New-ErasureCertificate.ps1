@@ -16,8 +16,9 @@ function New-ErasureCertificate {
         operations complete. It logs the certificate creation via Write-OperationLog.
 
     .PARAMETER OperationType
-        The type of erasure operation performed. Must be 'DiskErase' for full-disk
-        overwrite operations or 'UserWipe' for user profile data destruction.
+        The type of erasure operation performed. 'DiskErase' for full-disk overwrite
+        operations, 'UserWipe' for user profile data destruction, or 'ReissueWipe' for a
+        whole-device reissue wipe that leaves the operating system installed.
 
     .PARAMETER TargetDescription
         A human-readable description of the erasure target (e.g. "PhysicalDrive1 -
@@ -53,8 +54,10 @@ function New-ErasureCertificate {
     .OUTPUTS
         PSCustomObject with the following properties:
             CertificateId  - [guid]   Unique identifier for the certificate.
-            FilePath       - [string] Full path to the generated certificate file.
-            Success        - [bool]   Whether the certificate was written successfully.
+            FilePath       - [string] Full path to the generated .txt certificate file.
+            PdfFilePath    - [string] Path to the generated .pdf cert (Pro+ tier only; $null on Free).
+            Success        - [bool]   Whether the .txt certificate was written successfully.
+            LicenseTier    - [string] Active license tier at generation time (Free, Pro, Team, MSP).
 
     .EXAMPLE
         $cert = New-ErasureCertificate -OperationType 'DiskErase' `
@@ -83,7 +86,7 @@ function New-ErasureCertificate {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('DiskErase', 'UserWipe')]
+        [ValidateSet('DiskErase', 'UserWipe', 'ReissueWipe')]
         [string]$OperationType,
 
         [Parameter(Mandatory)]
@@ -104,7 +107,13 @@ function New-ErasureCertificate {
 
         [string]$OperatorName = "$env:USERDOMAIN\$env:USERNAME",
 
-        [string]$AdditionalNotes
+        [string]$AdditionalNotes,
+
+        # Output of Get-DiskSanitizeCapability. Optional: when absent the
+        # certificate falls back to a generic statement about Purge, because
+        # saying nothing is better than implying a device-specific finding that
+        # was never made.
+        [PSCustomObject]$SanitizeCapability
     )
 
     $certId    = [guid]::NewGuid()
@@ -114,9 +123,15 @@ function New-ErasureCertificate {
     $fileName  = "ErasureCert_${OperationType}_${dateStr}.txt"
     $certDir   = $Script:EraseDriveConfig.CertDirectory
     $filePath  = Join-Path $certDir $fileName
+    $pdfPath   = $null
     $version   = $Script:EraseDriveConfig.Version
 
-    Write-OperationLog -Message "Generating erasure certificate: $fileName" -LogLevel 'INFO'
+    # Check active license tier. Free returns no license metadata; Pro+ unlocks the PDF.
+    $licenseInfo = Test-EraseDriveLicense -Silent
+    $licenseTier = $licenseInfo.Tier
+    $isPaidTier  = $licenseInfo.Valid -and ($licenseTier -in @('Pro', 'Team', 'MSP'))
+
+    Write-OperationLog -Message "Generating erasure certificate: $fileName (license tier: $licenseTier)" -LogLevel 'INFO'
 
     try {
         # Ensure the certificate directory exists
@@ -126,12 +141,24 @@ function New-ErasureCertificate {
 
         $border = '=' * 80
 
-        # Determine method description
-        $methodDescription = switch ($Method) {
-            'Standard' { 'NIST 800-88 Clear (single pass)' }
-            'Secure'   { 'NIST 800-88 Clear (3-pass: zeros, ones, random)' }
-            default    { $Method }
+        # Determine method description.
+        #
+        # These strings are a compliance claim, so each one must describe what the
+        # corresponding code path actually does. Until 2026-09-09 'Standard' was
+        # labelled a single-pass NIST Clear here while the code performed no pass at
+        # all, and 'Secure' was labelled a NIST 3-pass when the sequence
+        # zeros/ones/random is DoD 5220.22-M, which NIST superseded.
+        $methodDescription = switch -Regex ($Method) {
+            '^Quick'    { 'Partition removal only. NO overwrite performed. NOT a sanitization method.' }
+            '^Standard' { 'NIST SP 800-88 Rev.1 Clear (single-pass zero overwrite)' }
+            '^Secure'   { 'NIST SP 800-88 Rev.1 Clear (multi-pass overwrite, DoD 5220.22-M style)' }
+            default     { $Method }
         }
+
+        # A compliance claim is only made when the method sanitizes AND the result
+        # was verified. Everything else states plainly what is missing.
+        $isSanitizing = ($Method -notmatch '^Quick')
+        $isVerified   = ($null -ne $VerificationResult -and $VerificationResult.Verified)
 
         $sb = [System.Text.StringBuilder]::new(4096)
 
@@ -188,11 +215,84 @@ function New-ErasureCertificate {
         }
         [void]$sb.AppendLine()
 
+        # ---- License ----
+        [void]$sb.AppendLine('--- LICENSE ---')
+        if ($isPaidTier) {
+            [void]$sb.AppendLine("Tier:               $licenseTier")
+            [void]$sb.AppendLine("License ID:         $($licenseInfo.LicenseId)")
+            [void]$sb.AppendLine("Issued To:          $($licenseInfo.IssuedTo)")
+        }
+        else {
+            [void]$sb.AppendLine('Tier:               Free (no license)')
+            [void]$sb.AppendLine('Note:               Free tier produces .txt only. Pro license unlocks the')
+            [void]$sb.AppendLine('                    signed PDF Certificate of Destruction at erasedrive.io')
+        }
+        [void]$sb.AppendLine()
+
         # ---- Compliance ----
         [void]$sb.AppendLine('--- COMPLIANCE ---')
-        [void]$sb.AppendLine('This erasure follows NIST SP 800-88 Rev.1 Clear guidelines.')
-        [void]$sb.AppendLine('For SSD Purge-level assurance, manufacturer-specific tools')
-        [void]$sb.AppendLine('are recommended in addition to this process.')
+        if (-not $isSanitizing) {
+            [void]$sb.AppendLine('NO COMPLIANCE CLAIM IS MADE BY THIS CERTIFICATE.')
+            [void]$sb.AppendLine('The method used removed partitioning only and did not overwrite')
+            [void]$sb.AppendLine('any data. The contents of this device remain recoverable. This')
+            [void]$sb.AppendLine('does not meet NIST SP 800-88 Rev.1 Clear, Purge or Destroy.')
+        }
+        elseif (-not $isVerified) {
+            [void]$sb.AppendLine('COMPLIANCE NOT ESTABLISHED: the overwrite was performed but its')
+            [void]$sb.AppendLine('result was NOT VERIFIED. NIST SP 800-88 Rev.1 section 4.7 requires')
+            [void]$sb.AppendLine('verification of sanitization results, so this certificate does not')
+            [void]$sb.AppendLine('assert Clear. Re-run with verification enabled before relying on')
+            [void]$sb.AppendLine('this device having been sanitized.')
+        }
+        else {
+            [void]$sb.AppendLine('This erasure meets NIST SP 800-88 Rev.1 Clear: every addressable')
+            [void]$sb.AppendLine('location was overwritten and the result was verified by sampling')
+            [void]$sb.AppendLine('per section 4.7.')
+            [void]$sb.AppendLine()
+
+            # Purge is a separate claim from Clear and must never be implied by
+            # it. Every branch below states explicitly that Purge was NOT
+            # performed, because this tool does not yet issue a sanitize command.
+            if ($null -eq $SanitizeCapability) {
+                [void]$sb.AppendLine('PURGE: not performed, and this device''s capability was not queried.')
+                [void]$sb.AppendLine('For SSD Purge-level assurance, the drive vendor''s own sanitize or')
+                [void]$sb.AppendLine('cryptographic-erase command is required in addition to this process.')
+            }
+            elseif ($null -eq $SanitizeCapability.PurgeCapable) {
+                [void]$sb.AppendLine('PURGE: not performed. This device''s Purge capability is UNKNOWN;')
+                [void]$sb.AppendLine('it could not be determined, which is NOT the same as absent. No')
+                [void]$sb.AppendLine('claim is made either way.')
+                if ($SanitizeCapability.Blockers) {
+                    foreach ($blocker in $SanitizeCapability.Blockers) {
+                        [void]$sb.AppendLine("  Reason: $blocker")
+                    }
+                }
+            }
+            elseif ($SanitizeCapability.PurgeCapable) {
+                [void]$sb.AppendLine('PURGE: AVAILABLE ON THIS DEVICE BUT NOT PERFORMED.')
+                [void]$sb.AppendLine('The device reports support for:')
+                foreach ($method in $SanitizeCapability.PurgeMethods) {
+                    [void]$sb.AppendLine("  - $method")
+                }
+                [void]$sb.AppendLine('Reaching NIST SP 800-88 Rev.1 Purge requires issuing one of those')
+                [void]$sb.AppendLine('commands. This tool does not issue them, so Purge was NOT achieved.')
+                [void]$sb.AppendLine('On flash media, overwriting cannot reach Purge at any number of')
+                [void]$sb.AppendLine('passes: the flash translation layer keeps over-provisioned, retired')
+                [void]$sb.AppendLine('and un-erased blocks outside the addressable LBA range.')
+                foreach ($blocker in $SanitizeCapability.Blockers) {
+                    [void]$sb.AppendLine("  Note: $blocker")
+                }
+            }
+            else {
+                [void]$sb.AppendLine('PURGE: not available on this device, and not performed.')
+                foreach ($blocker in $SanitizeCapability.Blockers) {
+                    [void]$sb.AppendLine("  Reason: $blocker")
+                }
+                if ($SanitizeCapability.DeviceAnswered) {
+                    [void]$sb.AppendLine('  The device was queried and reported no command reaching Purge.')
+                }
+            }
+        }
         [void]$sb.AppendLine()
 
         # ---- Additional Notes ----
@@ -244,10 +344,50 @@ function New-ErasureCertificate {
         Write-OperationLog -Message "Erasure certificate saved: $filePath (ID: $certId)" -LogLevel 'SUCCESS'
         Write-OperationLog -Message "Certificate signature file saved: $sigFilePath" -LogLevel 'INFO'
 
+        # ---- PDF rendering (Pro+ license only) ----
+        if ($isPaidTier) {
+            try {
+                $pdfPath = [System.IO.Path]::ChangeExtension($filePath, '.pdf')
+                $pdfResult = New-PdfCertificate `
+                    -OutPath          $pdfPath `
+                    -CertificateId    $certId `
+                    -Timestamp        $timestamp `
+                    -OperationType    $OperationType `
+                    -TargetDescription $TargetDescription `
+                    -Method           $Method `
+                    -MethodDescription $methodDescription `
+                    -DiskSerial       $DiskSerial `
+                    -DiskModel        $DiskModel `
+                    -DiskSizeGB       $DiskSizeGB `
+                    -VerificationResult $VerificationResult `
+                    -OperatorName     $OperatorName `
+                    -MachineName      $env:COMPUTERNAME `
+                    -ToolVersion      $version `
+                    -HmacHex          $hmacHex `
+                    -LicenseTier      $licenseTier `
+                    -LicenseId        $licenseInfo.LicenseId `
+                    -LicenseIssuedTo  $licenseInfo.IssuedTo
+
+                if ($pdfResult.Success) {
+                    Write-OperationLog -Message "PDF certificate saved: $($pdfResult.FilePath)" -LogLevel 'SUCCESS'
+                }
+                else {
+                    Write-OperationLog -Message "PDF certificate generation failed: $($pdfResult.Message)" -LogLevel 'WARNING'
+                    $pdfPath = $null
+                }
+            }
+            catch {
+                Write-OperationLog -Message "PDF certificate generation error: $($_.Exception.Message)" -LogLevel 'WARNING'
+                $pdfPath = $null
+            }
+        }
+
         return [PSCustomObject]@{
             CertificateId = $certId
             FilePath      = $filePath
+            PdfFilePath   = $pdfPath
             Success       = $true
+            LicenseTier   = $licenseTier
         }
     }
     catch {
@@ -257,7 +397,9 @@ function New-ErasureCertificate {
         return [PSCustomObject]@{
             CertificateId = $certId
             FilePath      = $null
+            PdfFilePath   = $null
             Success       = $false
+            LicenseTier   = $licenseTier
         }
     }
 }

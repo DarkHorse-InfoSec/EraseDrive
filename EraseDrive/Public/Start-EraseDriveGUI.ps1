@@ -28,7 +28,7 @@ function Start-EraseDriveGUI {
         Requires Administrator privileges.
         Requires .NET Framework 4.5+ (System.Windows.Forms, System.Drawing).
         Module:  EraseDrive
-        Version: 3.0.0
+        Version: 3.1.0
         Author:  DarkHorse InfoSec
 
     .OUTPUTS
@@ -104,6 +104,18 @@ function Start-EraseDriveGUI {
     $script:operationRunning = $false
     $script:operationType = $null
     $script:operationStart = $null
+
+    # The operation runs in a background runspace, so progress cannot be written to
+    # the form directly. A synchronized hashtable is a reference type shared across
+    # runspaces in this process: the worker writes, the poll timer reads on the UI
+    # thread. This matters because the default erase method performs a full
+    # single-pass overwrite; on a 114 GB disk that is twenty minutes or more, and
+    # a marquee bar with no numbers is indistinguishable from a hang.
+    $script:progressState = [hashtable]::Synchronized(@{
+        Percent   = -1
+        Status    = $null
+        Operation = $null
+    })
 
     # ── Load logo image ───────────────────────────────────────────────────────
     $script:logoImage = $null
@@ -215,8 +227,52 @@ function Start-EraseDriveGUI {
     $lblStatus.ForeColor = $cGreenAccent
     $lblStatus.AutoSize  = $true
     $lblStatus.Anchor    = 'Top, Right'
-    $lblStatus.Location  = New-Object System.Drawing.Point(940, 30)
+    $lblStatus.Location  = New-Object System.Drawing.Point(940, 18)
     $headerPanel.Controls.Add($lblStatus)
+
+    # License tier badge (below status, right-aligned)
+    $lblTier = New-Object System.Windows.Forms.Label
+    $lblTier.Text      = 'TIER: FREE'
+    $lblTier.Font      = $fontSubtitle
+    $lblTier.ForeColor = $cDimText
+    $lblTier.AutoSize  = $true
+    $lblTier.Anchor    = 'Top, Right'
+    $lblTier.Location  = New-Object System.Drawing.Point(900, 48)
+    $headerPanel.Controls.Add($lblTier)
+
+    # The hardcoded X above placed the badge past the right edge of the header on
+    # a narrower form and at non-100% DPI, so the tier was never visible even with
+    # a valid Pro license loaded. Position it from the panel's real width instead,
+    # and reposition whenever the panel resizes or the text changes width.
+    $positionTierBadge = {
+        if ($headerPanel.ClientSize.Width -gt 0) {
+            $x = $headerPanel.ClientSize.Width - $lblTier.PreferredWidth - 24
+            if ($x -lt 0) { $x = 0 }
+            $lblTier.Location = New-Object System.Drawing.Point([int]$x, 48)
+        }
+    }
+    $headerPanel.Add_Resize({ & $positionTierBadge })
+
+    # Helper to refresh the tier badge from the active license
+    $script:currentLicense = $null
+    $refreshTierBadge = {
+        try {
+            $script:currentLicense = Test-EraseDriveLicense -Silent
+        }
+        catch {
+            $script:currentLicense = [PSCustomObject]@{ Tier = 'Free'; Valid = $false }
+        }
+        $tier = $script:currentLicense.Tier
+        $lblTier.Text = "TIER: $($tier.ToUpper())"
+        switch ($tier) {
+            'Free' { $lblTier.ForeColor = $cDimText }
+            'Pro'  { $lblTier.ForeColor = $cGreenAccent }
+            'Team' { $lblTier.ForeColor = $cBlueAccent }
+            'MSP'  { $lblTier.ForeColor = [System.Drawing.Color]::FromArgb(190, 130, 230) }
+            default { $lblTier.ForeColor = $cDimText }
+        }
+        & $positionTierBadge
+    }
 
     $form.Controls.Add($headerPanel)
 
@@ -253,6 +309,14 @@ function Start-EraseDriveGUI {
 
     # DataTable schema
     $diskTable = New-Object System.Data.DataTable
+
+    # An explicit tick, not just a highlighted row. Selecting the wrong disk is the
+    # one unrecoverable mistake this tool can make, and row highlight is easy to
+    # misread on a dark theme or to leave stale after a refresh. The erase handler
+    # reads THIS column, never the highlight.
+    $selectCol = $diskTable.Columns.Add('SELECT', [bool])
+    $selectCol.DefaultValue = $false
+
     @('Number', 'FriendlyName', 'SerialNumber', 'MediaType', 'BusType',
       'OperationalStatus', 'HealthStatus', 'Size (GB)', 'Partitions', 'Safety Status') | ForEach-Object {
         $diskTable.Columns.Add($_, [string]) | Out-Null
@@ -262,7 +326,7 @@ function Start-EraseDriveGUI {
     $dgv = New-Object System.Windows.Forms.DataGridView
     $dgv.Dock                    = 'Fill'
     $dgv.DataSource              = $diskTable
-    $dgv.ReadOnly                = $true
+    $dgv.ReadOnly                = $false   # per-column below; only SELECT is editable
     $dgv.AllowUserToAddRows      = $false
     $dgv.AllowUserToDeleteRows   = $false
     $dgv.AllowUserToResizeRows   = $false
@@ -284,6 +348,58 @@ function Start-EraseDriveGUI {
     $dgv.ColumnHeadersDefaultCellStyle.Font      = $fontButton
     $dgv.EnableHeadersVisualStyles = $false
     $dgv.ColumnHeadersBorderStyle  = 'Single'
+
+    # Only SELECT is editable, and it is pinned to the far left at a fixed width.
+    # Re-applied on every binding because rebinding regenerates the columns.
+    $dgv.Add_DataBindingComplete({
+        param($sender, $e)
+        foreach ($c in $sender.Columns) {
+            $c.ReadOnly = ($c.Name -ne 'SELECT')
+        }
+        $sel = $sender.Columns['SELECT']
+        if ($null -ne $sel) {
+            $sel.HeaderText   = 'SELECT'
+            $sel.AutoSizeMode = 'None'
+            $sel.Width        = 70
+            $sel.DisplayIndex = 0
+        }
+    })
+
+    # Without committing the edit immediately, CellValueChanged does not fire until
+    # focus leaves the cell, so the tick would look set while the value was still
+    # unchanged underneath.
+    $dgv.Add_CurrentCellDirtyStateChanged({
+        param($sender, $e)
+        if ($sender.IsCurrentCellDirty) {
+            $sender.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+        }
+    })
+
+    # Exactly one disk may be ticked. Re-entrancy guard because clearing the other
+    # rows raises CellValueChanged again.
+    $script:suppressCheckSync = $false
+    $dgv.Add_CellValueChanged({
+        param($sender, $e)
+        if ($e.RowIndex -lt 0) { return }
+        $col = $sender.Columns[$e.ColumnIndex]
+        if ($null -eq $col -or $col.Name -ne 'SELECT') { return }
+        if ($script:suppressCheckSync) { return }
+
+        $script:suppressCheckSync = $true
+        try {
+            if ([bool]$sender.Rows[$e.RowIndex].Cells[$e.ColumnIndex].Value) {
+                foreach ($r in $sender.Rows) {
+                    if ($r.Index -ne $e.RowIndex) {
+                        $r.Cells[$e.ColumnIndex].Value = $false
+                    }
+                }
+                $sender.Rows[$e.RowIndex].Selected = $true
+            }
+        }
+        finally {
+            $script:suppressCheckSync = $false
+        }
+    })
 
     # Color-code rows based on Safety Status
     $dgv.Add_CellFormatting({
@@ -431,6 +547,8 @@ function Start-EraseDriveGUI {
     $btnCancel    = New-ThemedButton -Text 'CANCEL'             -BgColor $cOrangeAccent  -X 460  -Y 10 -Width 100 -Height 35
     $btnCancel.Visible = $false
 
+    $btnLoadLicense = New-ThemedButton -Text 'LOAD LICENSE' -BgColor ([System.Drawing.Color]::FromArgb(140, 100, 200)) -X 770 -Y 10 -Width 140 -Height 35
+
     $btnExit = New-ThemedButton -Text 'EXIT' -BgColor ([System.Drawing.Color]::FromArgb(90, 90, 90)) -X 920 -Y 10 -Width 80 -Height 35
 
     # Method ComboBox
@@ -442,7 +560,10 @@ function Start-EraseDriveGUI {
     $lblMethod.Font      = $fontNormal
 
     $cmbMethod = New-Object System.Windows.Forms.ComboBox
-    $cmbMethod.Items.AddRange(@('Standard', 'Secure'))
+    # Standard is index 0 and stays the default: it is the one that actually
+    # sanitizes and verifies. Quick is listed last so it cannot be picked by
+    # accident, and its label says what it does not do.
+    $cmbMethod.Items.AddRange(@('Standard', 'Secure', 'Quick'))
     $cmbMethod.SelectedIndex  = 0
     $cmbMethod.Location       = New-Object System.Drawing.Point(650, 14)
     $cmbMethod.Size           = New-Object System.Drawing.Size(100, 25)
@@ -468,9 +589,20 @@ function Start-EraseDriveGUI {
     $chkClearLogs.Checked   = $false
     $chkClearLogs.Font      = $fontNormal
 
+    # Off by default. An erase leaves the disk raw, which is the correct end state
+    # for a destruction tool; reformatting is the operator opting back into a
+    # usable disk, and it only runs after the erase has been verified.
+    $chkReformat = New-Object System.Windows.Forms.CheckBox
+    $chkReformat.Text      = 'Reformat disk after erase (NTFS)'
+    $chkReformat.Location  = New-Object System.Drawing.Point(390, 58)
+    $chkReformat.AutoSize  = $true
+    $chkReformat.ForeColor = $cGray
+    $chkReformat.Checked   = $false
+    $chkReformat.Font      = $fontNormal
+
     $controlPanel.Controls.AddRange(@(
-        $btnUserWipe, $btnEraseDisk, $btnRefresh, $btnCancel, $btnExit,
-        $lblMethod, $cmbMethod, $chkBackup, $chkClearLogs
+        $btnUserWipe, $btnEraseDisk, $btnRefresh, $btnCancel, $btnLoadLicense, $btnExit,
+        $lblMethod, $cmbMethod, $chkBackup, $chkClearLogs, $chkReformat
     ))
     $form.Controls.Add($controlPanel)
 
@@ -506,12 +638,16 @@ function Start-EraseDriveGUI {
         $script:operationRunning = $true
         $script:operationType    = $opType
         $script:operationStart   = [DateTime]::Now
+        $script:progressState.Percent   = -1
+        $script:progressState.Status    = $null
+        $script:progressState.Operation = $null
         $btnUserWipe.Enabled     = $false
         $btnEraseDisk.Enabled    = $false
         $btnRefresh.Enabled      = $false
         $cmbMethod.Enabled       = $false
         $chkBackup.Enabled       = $false
         $chkClearLogs.Enabled    = $false
+        $chkReformat.Enabled     = $false
         $btnCancel.Visible       = $true
         $progressBar.Visible     = $true
         $progressBar.Value       = 0
@@ -533,6 +669,7 @@ function Start-EraseDriveGUI {
         $cmbMethod.Enabled       = $true
         $chkBackup.Enabled       = $true
         $chkClearLogs.Enabled    = $true
+        $chkReformat.Enabled     = $true
         $btnCancel.Visible       = $false
         $progressBar.Visible     = $false
         $progressBar.Style       = 'Blocks'
@@ -578,11 +715,28 @@ function Start-EraseDriveGUI {
     $pollTimer.Add_Tick({
         if ($null -eq $script:asyncResult) { return }
 
-        # Update elapsed time display
+        # Update elapsed time and, once the worker reports a real percentage,
+        # switch the bar from marquee to a determinate value. Percent stays -1 until
+        # the first callback arrives, which is what distinguishes "no news yet" from
+        # "genuinely at 0%".
         if ($null -ne $script:operationStart) {
             $elapsed    = [DateTime]::Now - $script:operationStart
             $elapsedStr = '{0:hh\:mm\:ss}' -f $elapsed
-            $lblProgress.Text = "$($script:operationType) -- Elapsed: $elapsedStr"
+
+            $pct = $script:progressState.Percent
+            if ($null -ne $pct -and $pct -ge 0) {
+                if ($progressBar.Style -ne 'Blocks') { $progressBar.Style = 'Blocks' }
+                $clamped = [Math]::Max(0, [Math]::Min(100, [int]$pct))
+                if ($progressBar.Value -ne $clamped) { $progressBar.Value = $clamped }
+
+                $stageText = $script:progressState.Status
+                $opText    = $script:progressState.Operation
+                $detail    = if ($opText) { "$stageText -- $opText" } else { $stageText }
+                $lblProgress.Text = "$($script:operationType) [$clamped%] $detail -- Elapsed: $elapsedStr"
+            }
+            else {
+                $lblProgress.Text = "$($script:operationType) -- Elapsed: $elapsedStr"
+            }
         }
 
         if ($script:asyncResult.IsCompleted) {
@@ -631,13 +785,53 @@ function Start-EraseDriveGUI {
                     $msg += "`nDuration: $($result.Duration)"
                 }
                 if ($result.CertificatePath) {
-                    $msg += "`nCertificate: $($result.CertificatePath)"
+                    $msg += "`nCertificate (TXT): $($result.CertificatePath)"
+                }
+                if ($result.PSObject.Properties['PdfCertificatePath'] -and $result.PdfCertificatePath) {
+                    $msg += "`nCertificate (PDF): $($result.PdfCertificatePath)"
                 }
                 if ($result.ProfilesRemoved) {
                     $msg += "`nProfiles removed: $($result.ProfilesRemoved -join ', ')"
                 }
                 if ($result.PSObject.Properties['Verified']) {
                     $msg += "`nVerified: $($result.Verified)"
+                }
+
+                # Disk erase results carry DiskNumber; user-data wipe results do not.
+                # An erased disk has no partition table and so no drive letter, which
+                # reads as a bricked disk to anyone who does not know that is the point.
+                if ($result.PSObject.Properties['DiskNumber']) {
+                    $didReformat = $result.PSObject.Properties['Reformatted'] -and $result.Reformatted
+                    $reformatNote = if ($result.PSObject.Properties['ReformatMessage']) { $result.ReformatMessage } else { $null }
+
+                    if ($didReformat) {
+                        $letter = if ($result.PSObject.Properties['DriveLetter']) { $result.DriveLetter } else { $null }
+                        $msg += if ($letter) {
+                            "`n`nThe disk was reformatted and is ready to use as drive ${letter}:."
+                        }
+                        else {
+                            "`n`nThe disk was reformatted. Windows did not assign a drive letter; assign one in Disk Management (diskmgmt.msc)."
+                        }
+                    }
+                    else {
+                        $msg += "`n`nTHE DISK IS NOW RAW, AND THAT IS NORMAL." +
+                                "`nErasing removes the partition table along with the data, so the disk" +
+                                "`nhas no drive letter and will not appear in File Explorer. It is not" +
+                                "`ndamaged and it has not been lost."
+                        if ($reformatNote) {
+                            $msg += "`n`n$reformatNote"
+                        }
+                        $msg += "`n`nTo make it usable again, either:" +
+                                "`n  - re-run the erase with 'Reformat disk after erase' ticked, or" +
+                                "`n  - open Disk Management (diskmgmt.msc), right-click the disk," +
+                                "`n    choose Initialize Disk, then New Simple Volume."
+                    }
+                }
+
+                # Free-tier upgrade nudge
+                $tierForNudge = if ($result.PSObject.Properties['LicenseTier']) { $result.LicenseTier } else { 'Free' }
+                if ($tierForNudge -eq 'Free') {
+                    $msg += "`n`nUpgrade to Pro for a signed PDF Certificate of Destruction your auditor will accept. erasedrive.io"
                 }
 
                 Write-OperationLog -Message "GUI operation completed: $($result.Message)" -LogLevel 'SUCCESS'
@@ -712,10 +906,17 @@ function Start-EraseDriveGUI {
 
         $script:ps = [PowerShell]::Create()
         $script:ps.AddScript({
-            param($modPath, $wipeMethod, $doClearLogs)
+            param($modPath, $wipeMethod, $doClearLogs, $progress)
             Import-Module $modPath -Force
-            Invoke-ForensicUserDataWipe -WipeMethod $wipeMethod -ClearEventLogs:$doClearLogs -Confirm:$false
-        }).AddArgument($modulePath).AddArgument($method).AddArgument($clearLogs) | Out-Null
+            Invoke-ForensicUserDataWipe -WipeMethod $wipeMethod -ClearEventLogs:$doClearLogs -Confirm:$false -ReportProgress {
+                param($info)
+                # Profile removal can sit on a single step for a long time. Without
+                # this the operator sees only a marquee and assumes a hang.
+                $progress.Percent   = $info.PercentComplete
+                $progress.Status    = $info.Status
+                $progress.Operation = $info.CurrentOperation
+            }
+        }).AddArgument($modulePath).AddArgument($method).AddArgument($clearLogs).AddArgument($script:progressState) | Out-Null
 
         $script:asyncResult = $script:ps.BeginInvoke()
         $pollTimer.Start()
@@ -723,11 +924,24 @@ function Start-EraseDriveGUI {
 
     # ── ERASE DISK ────────────────────────────────────────────────────────────
     $btnEraseDisk.Add_Click({
-        # Require a disk selection
-        if ($dgv.SelectedRows.Count -eq 0) {
+        # Act on the ticked row, NOT the highlighted one. A highlight can be left
+        # over from a refresh or moved by an arrow key; a tick is deliberate.
+        $checkedRows = @($dgv.Rows | Where-Object {
+            $null -ne $_.Cells['SELECT'].Value -and [bool]$_.Cells['SELECT'].Value
+        })
+
+        if ($checkedRows.Count -eq 0) {
             [System.Windows.Forms.MessageBox]::Show(
-                'Please select a disk from the list first.',
+                'Tick the SELECT box next to the disk you want to erase.',
                 'No Disk Selected', 'OK', 'Warning'
+            )
+            return
+        }
+
+        if ($checkedRows.Count -gt 1) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "$($checkedRows.Count) disks are ticked. Tick exactly one.",
+                'Multiple Disks Selected', 'OK', 'Warning'
             )
             return
         }
@@ -741,7 +955,7 @@ function Start-EraseDriveGUI {
             return
         }
 
-        $selectedRow  = $dgv.SelectedRows[0]
+        $selectedRow  = $checkedRows[0]
         $diskNum      = [int]$selectedRow.Cells['Number'].Value
         $diskName     = $selectedRow.Cells['FriendlyName'].Value
         $diskSerial   = $selectedRow.Cells['SerialNumber'].Value
@@ -769,7 +983,32 @@ function Start-EraseDriveGUI {
             return
         }
 
-        $method = $cmbMethod.SelectedItem.ToString()
+        $method   = $cmbMethod.SelectedItem.ToString()
+        $reformat = $chkReformat.Checked
+
+        $afterText = if ($reformat) {
+            'Reformat as NTFS after the erase is verified'
+        }
+        else {
+            'Leave the disk raw (no drive letter)'
+        }
+
+        # Quick does not overwrite anything. Someone reaching for it to decommission
+        # a machine must be told, before the partition table goes, that the data
+        # will still be there.
+        if ($method -eq 'Quick') {
+            $quickWarn = [System.Windows.Forms.MessageBox]::Show(
+                "QUICK does not erase data.`n`n" +
+                "It removes the partition table and nothing else. Every file on this" +
+                "`ndisk stays on the media and can be recovered with ordinary tools." +
+                "`n`nThe certificate will state that no sanitization was performed and" +
+                "`nwill make no compliance claim." +
+                "`n`nUse Standard or Secure to actually destroy the data." +
+                "`n`nContinue with QUICK anyway?",
+                'Quick does not sanitize', 'YesNo', 'Warning'
+            )
+            if ($quickWarn -ne 'Yes') { return }
+        }
 
         # First confirmation
         $confirm = [System.Windows.Forms.MessageBox]::Show(
@@ -777,7 +1016,8 @@ function Start-EraseDriveGUI {
             "  Disk:   $diskName`n" +
             "  Serial: $diskSerial`n" +
             "  Size:   $sizeGB GB`n" +
-            "  Method: $method`n`n" +
+            "  Method: $method`n" +
+            "  After:  $afterText`n`n" +
             "ALL DATA ON THIS DISK WILL BE PERMANENTLY DESTROYED.`n" +
             "This action is IRREVERSIBLE. Continue?",
             'Confirm Disk Erasure', 'YesNo', 'Warning'
@@ -799,15 +1039,22 @@ function Start-EraseDriveGUI {
             return
         }
 
-        Write-OperationLog -Message "GUI: Starting disk erase - Disk #$diskNum ($diskName), Method: $method" -LogLevel 'INFO'
+        Write-OperationLog -Message "GUI: Starting disk erase - Disk #$diskNum ($diskName), Method: $method, Reformat: $reformat" -LogLevel 'INFO'
         & $setRunningState 'Disk Erase'
 
         $script:ps = [PowerShell]::Create()
         $script:ps.AddScript({
-            param($modPath, $dNum, $eraseMethod)
+            param($modPath, $dNum, $eraseMethod, $doReformat, $progress)
             Import-Module $modPath -Force
-            Invoke-SecureDiskErase -DiskNumber $dNum -EraseMethod $eraseMethod -Confirm:$false
-        }).AddArgument($modulePath).AddArgument($diskNum).AddArgument($method) | Out-Null
+            Invoke-SecureDiskErase -DiskNumber $dNum -EraseMethod $eraseMethod -Reformat:$doReformat -Confirm:$false -ReportProgress {
+                param($info)
+                # Writing into the shared hashtable is the only cross-runspace
+                # communication here. Never touch the form from this runspace.
+                $progress.Percent   = $info.PercentComplete
+                $progress.Status    = $info.Status
+                $progress.Operation = $info.CurrentOperation
+            }
+        }).AddArgument($modulePath).AddArgument($diskNum).AddArgument($method).AddArgument($reformat).AddArgument($script:progressState) | Out-Null
 
         $script:asyncResult = $script:ps.BeginInvoke()
         $pollTimer.Start()
@@ -816,6 +1063,64 @@ function Start-EraseDriveGUI {
     # ── REFRESH ───────────────────────────────────────────────────────────────
     $btnRefresh.Add_Click({
         & $refreshDisks
+    })
+
+    # ── LOAD LICENSE ──────────────────────────────────────────────────────────
+    $btnLoadLicense.Add_Click({
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Title = 'Select EraseDrive license file (.lic)'
+        $ofd.Filter = 'EraseDrive license (*.lic)|*.lic|All files (*.*)|*.*'
+        $ofd.Multiselect = $false
+
+        if ($ofd.ShowDialog() -ne 'OK') { return }
+
+        $sourcePath = $ofd.FileName
+
+        # Validate the chosen file BEFORE copying so we don't clobber an existing valid license with garbage
+        try {
+            $check = Test-EraseDriveLicense -LicensePath $sourcePath -Silent
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Could not read license file:`n$($_.Exception.Message)",
+                'License Error', 'OK', 'Error'
+            )
+            return
+        }
+
+        if (-not $check.Valid) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "This license file is not valid.`n`nReason: $($check.Reason)`n`nNothing was changed. If you believe this is wrong, contact support with your purchase ID.",
+                'Invalid License', 'OK', 'Warning'
+            )
+            return
+        }
+
+        # Copy to the canonical location
+        $destPath = $Script:EraseDriveConfig.LicensePath
+        $destDir = Split-Path $destPath -Parent
+        try {
+            if (-not (Test-Path $destDir)) {
+                New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $sourcePath -Destination $destPath -Force -ErrorAction Stop
+            Write-OperationLog -Message "License loaded into $destPath (Tier: $($check.Tier), ID: $($check.LicenseId))" -LogLevel 'SUCCESS'
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Could not install license file to $($destPath):`n$($_.Exception.Message)`n`nTry running EraseDrive as Administrator.",
+                'License Install Failed', 'OK', 'Error'
+            )
+            return
+        }
+
+        # Refresh badge
+        & $refreshTierBadge
+
+        [System.Windows.Forms.MessageBox]::Show(
+            "License loaded.`n`nTier: $($check.Tier)`nIssued to: $($check.IssuedTo)`nLicense ID: $($check.LicenseId)`n`nFuture certificates will include the signed PDF Certificate of Destruction.",
+            'License Activated', 'OK', 'Information'
+        )
     })
 
     # ── CANCEL ────────────────────────────────────────────────────────────────
@@ -898,6 +1203,8 @@ function Start-EraseDriveGUI {
     #  INITIAL LOAD & LAUNCH
     # ══════════════════════════════════════════════════════════════════════════
     Write-OperationLog -Message "EraseDrive GUI v$($Script:EraseDriveConfig.Version) started." -LogLevel 'INFO'
+    & $refreshTierBadge
+    Write-OperationLog -Message "Active license tier: $($script:currentLicense.Tier)" -LogLevel 'INFO'
     & $refreshDisks
 
     [System.Windows.Forms.Application]::Run($form)
