@@ -96,6 +96,157 @@ Describe 'Invoke-SecureOverwrite: the final pass must be verifiable' {
 }
 
 # ============================================================================
+#  1b. The overwrite engine must survive a disk bigger than Int32
+# ============================================================================
+
+Describe 'Invoke-SecureOverwrite: large-disk arithmetic and honest success' {
+
+    BeforeAll {
+        $script:overwriteSource = Get-Content -Raw (
+            Join-Path $script:modulePath 'Private\Invoke-SecureOverwrite.ps1')
+    }
+
+    It 'computes a write length for a 114.6 GB disk without overflowing' {
+        # The exact arithmetic that threw on the real SanDisk:
+        #   Cannot convert argument "val2", with value: "123041963520", for "Min"
+        #   to type "System.Int32"
+        # PowerShell selects the [Math]::Min overload from the FIRST argument, so an
+        # Int32 buffer length picks Min(int,int) and then fails to convert a
+        # multi-gigabyte remainder. Every disk over 2 GB threw on iteration one.
+        $totalBytes = [int64]123041963520
+        $buffer     = [byte[]]::new(1MB)
+        $written    = [int64]0
+
+        { [int64][Math]::Min([int64]$buffer.Length, [int64]($totalBytes - $written)) } |
+            Should -Not -Throw
+
+        $writeLen = [int64][Math]::Min([int64]$buffer.Length, [int64]($totalBytes - $written))
+        $writeLen | Should -Be 1MB
+    }
+
+    It 'clamps the final partial buffer at the end of a large disk' {
+        $totalBytes = [int64]123041963520
+        $buffer     = [byte[]]::new(1MB)
+        $written    = [int64]($totalBytes - 4096)
+
+        $writeLen = [int64][Math]::Min([int64]$buffer.Length, [int64]($totalBytes - $written))
+        $writeLen | Should -Be 4096
+    }
+
+    It 'does not use the unguarded Min form anywhere' {
+        # Regression guard on the shape, because the value that triggers it only
+        # appears on hardware no test can safely touch.
+        $script:overwriteSource | Should -Not -Match '\[Math\]::Min\(\$buffer\.Length,'
+    }
+
+    It 'counts a failed pass as failed, not as completed' {
+        # The second half of the defect. The catch block incremented
+        # $passesCompleted, so Success = ($passesCompleted -eq $Passes) was $true
+        # after a pass wrote zero bytes, and the function reported a successful
+        # sanitization of a disk it had never written to.
+        $script:overwriteSource | Should -Match '\$passesFailed\+\+'
+
+        if ($script:overwriteSource -notmatch '(?s)catch \{\s*#[^\n]*\n\s*#[^\n]*\n\s*\$passesFailed') {
+            # Tolerate comment reflow; the point is the catch must not credit a pass.
+            $catchBlocks = [regex]::Matches($script:overwriteSource, '(?s)catch \{.*?\}')
+            foreach ($c in $catchBlocks) {
+                $c.Value | Should -Not -Match '\$passesCompleted\+\+'
+            }
+        }
+    }
+
+    It 'never fills a buffer one byte at a time' {
+        # Measured 2026-09-09: the per-byte PowerShell loop cost 1.985s per 1 MB
+        # buffer. Across the 117,342 buffers of a 114.6 GB disk that is 64.7 hours
+        # of CPU before a single sector is written, which is why the first real run
+        # looked like a hang. Native array operations do the same work in ~0.01s.
+        $script:overwriteSource | Should -Not -Match '\$Buffer\[\$i\]\s*=\s*\$byteVal'
+        $script:overwriteSource | Should -Not -Match '\$Buffer\[\$i\]\s*=\s*\$patBytes'
+        $script:overwriteSource | Should -Match '\[Array\]::Clear'
+        $script:overwriteSource | Should -Match '\[Array\]::Copy'
+    }
+
+    It 'fills a fixed pattern once per pass, not once per write' {
+        # A fixed pattern produces identical bytes every time, so refilling per
+        # write was pure waste. Only RANDOM needs regenerating.
+        $script:overwriteSource | Should -Match '\$needsRefillEachWrite\s*=\s*\(\$pattern -eq ''RANDOM''\)'
+        foreach ($m in [regex]::Matches($script:overwriteSource, '(?m)^\s*(if \(\$needsRefillEachWrite\) \{ )?Fill-Buffer[^
+]*$')) {
+            # Every call inside a write loop must be guarded; the single unguarded
+            # call is the once-per-pass fill.
+            $m.Value | Should -Match 'Fill-Buffer'
+        }
+        ([regex]::Matches($script:overwriteSource, 'if \(\$needsRefillEachWrite\) \{ Fill-Buffer')).Count |
+            Should -Be 2 -Because 'both the raw-disk and free-space write loops must be guarded'
+    }
+
+    It 'throttles progress to whole-percent changes' {
+        # ~117,000 callbacks per pass is wasteful and puts needless script nesting
+        # in the hottest loop in the product.
+        $script:overwriteSource | Should -Match '\$lastReportedPct'
+        $script:overwriteSource | Should -Match '\$pct -ne \$lastReportedPct'
+    }
+
+    It 'logs progress directly, not only through the callback' {
+        # The callback path is currently unreliable (defect 6). An operator watching
+        # a long write needs evidence of movement that does not depend on it.
+        $script:overwriteSource | Should -Match "Write-OperationLog[^
+]*\`$pct%"
+    }
+
+    It 'requires bytes to have reached the media before reporting success' {
+        # An overwrite that writes nothing has sanitized nothing, however cleanly
+        # its loop exited. This is the invariant that would have caught the whole
+        # thing on the very first real run.
+        $script:overwriteSource | Should -Match '\$wroteSomething'
+        $script:overwriteSource | Should -Match '\$overwriteSucceeded'
+    }
+}
+
+# ============================================================================
+#  1c. "Nothing happened" must never read as "it worked"
+#
+#  Four of the five defects found on 2026-09-09 were the same shape: a code path
+#  that did no work and reported success. They are grouped here because the shape
+#  is the bug, not any one instance of it.
+# ============================================================================
+
+Describe 'No-op must not report success' {
+
+    BeforeAll {
+        $script:overwriteSource = Get-Content -Raw (
+            Join-Path $script:modulePath 'Private\Invoke-SecureOverwrite.ps1')
+        $script:verifySource = Get-Content -Raw (
+            Join-Path $script:modulePath 'Private\Test-EraseVerification.ps1')
+    }
+
+    It 'refuses to call an unknown-size physical disk a successful overwrite' {
+        # A whole physical disk never legitimately reports 0 bytes. Reaching that
+        # branch means the size query failed, so nothing was written and nothing is
+        # known. The old code returned Success=$true there, which would have
+        # certified a sanitization of a disk it could not even measure.
+        $script:overwriteSource | Should -Match 'Refusing to report a successful overwrite'
+        $script:overwriteSource | Should -Match 'if \(\$isPhysicalDisk\) \{'
+    }
+
+    It 'still allows a genuinely empty volume in free-space mode' {
+        # The other half of the distinction: a drive letter with no free space
+        # really does have nothing to do, and that is not an error. A guard that
+        # simply always refuses would pass the test above and be wrong.
+        $script:overwriteSource | Should -Match '0 bytes of free space'
+    }
+
+    It 'does not count an unreadable sector as a verified sector' {
+        # Test-EraseVerification compared $bytesRead bytes against the expected
+        # pattern, having seeded $match = $true. A read returning 0 bytes skipped
+        # the loop entirely and was counted as PASSED: an unreadable sector taken
+        # as proof of erasure.
+        $script:verifySource | Should -Match '\$match = \(\$bytesRead -gt 0\)'
+        $script:verifySource | Should -Not -Match '(?m)^\s*\$match = \$true\s*$'
+    }
+}
+
+# ============================================================================
 #  2. What the method writes is what verification is told to expect
 # ============================================================================
 
@@ -122,7 +273,10 @@ Describe 'Invoke-SecureDiskErase: write/verify contract' {
         Mock Get-PhysicalDisk -RemoveParameterType 'Usage', 'HealthStatus', 'VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '1'; SerialNumber = 'S1'; FriendlyName = 'Test Disk' })
         }
-        Mock Get-Disk   { [PSCustomObject]@{ Number = 1; Size = 100GB } }
+        # Every property the reformat path reads must be present: an ABSENT
+        # LargestFreeExtent compares as $null -le 0, which is $true.
+        Mock Get-Disk   { [PSCustomObject]@{ Number = 1; Size = 100GB; PartitionStyle = 'RAW'; LargestFreeExtent = 100GB; AllocatedSize = 0 } }
+        Mock Update-HostStorageCache { }
         Mock Clear-Disk { }
 
         # The overwrite engine's real contract, reproduced: the byte it reports is
@@ -202,6 +356,30 @@ Describe 'Invoke-SecureDiskErase: write/verify contract' {
         Should -Invoke Test-EraseVerification -Times 1 -Exactly -ParameterFilter {
             $ExpectedPattern -eq [byte]0xFF
         }
+    }
+
+    It 'fails the whole erase when the overwrite reports failure' {
+        # Before the fix the engine could return Success=$true after writing 0
+        # bytes. Now that it reports failure honestly, the erase must treat that as
+        # fatal rather than carrying on to verify and certify an untouched disk.
+        Mock Invoke-SecureOverwrite {
+            [PSCustomObject]@{
+                Success          = $false
+                BytesOverwritten = [int64]0
+                PassesCompleted  = 0
+                PassesFailed     = 1
+                Duration         = [timespan]::FromSeconds(1)
+                Message          = 'Secure overwrite FAILED: 0 of 123041963520 bytes written.'
+                FinalPattern     = $null
+            }
+        }
+
+        $result = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Reformat -Confirm:$false
+
+        $result.Success     | Should -BeFalse
+        $result.Verified    | Should -BeFalse
+        $result.Reformatted | Should -BeFalse
+        Should -Invoke Test-EraseVerification -Times 0
     }
 
     It 'skips verification, with a reason, when the media was left unpredictable' {
@@ -288,7 +466,10 @@ Describe 'Quick: honest about doing nothing' {
         Mock Get-PhysicalDisk -RemoveParameterType 'Usage', 'HealthStatus', 'VirtualDisk' {
             @([PSCustomObject]@{ DeviceId = '1'; SerialNumber = 'S1'; FriendlyName = 'Test Disk' })
         }
-        Mock Get-Disk   { [PSCustomObject]@{ Number = 1; Size = 100GB } }
+        # Every property the reformat path reads must be present: an ABSENT
+        # LargestFreeExtent compares as $null -le 0, which is $true.
+        Mock Get-Disk   { [PSCustomObject]@{ Number = 1; Size = 100GB; PartitionStyle = 'RAW'; LargestFreeExtent = 100GB; AllocatedSize = 0 } }
+        Mock Update-HostStorageCache { }
         Mock Clear-Disk { }
         Mock Invoke-SecureOverwrite { throw 'Quick must not overwrite anything' }
         Mock Test-EraseVerification { throw 'Quick must not be verified: nothing was written' }

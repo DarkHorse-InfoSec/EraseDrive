@@ -91,10 +91,18 @@ Describe 'Invoke-SecureDiskErase -Reformat' {
             })
         }
 
-        # No PartitionStyle property: a freshly erased disk reports RAW, which is what
-        # drives the Initialize-Disk branch.
+        # A freshly erased disk: RAW, nothing allocated, all of it free. Every
+        # property the reformat reads must be present, because an ABSENT
+        # LargestFreeExtent compares as $null -le 0, which is $true in PowerShell
+        # and would trip the no-free-extent guard in every test.
         Mock Get-Disk {
-            [PSCustomObject]@{ Number = 1; Size = $script:diskSizeBytes }
+            [PSCustomObject]@{
+                Number            = 1
+                Size              = $script:diskSizeBytes
+                PartitionStyle    = 'RAW'
+                LargestFreeExtent = $script:diskSizeBytes
+                AllocatedSize     = 0
+            }
         }
 
         Mock Clear-Disk { }
@@ -132,7 +140,9 @@ Describe 'Invoke-SecureDiskErase -Reformat' {
             }
         }
 
-        # The three writes the reformat performs.
+        # The writes the reformat performs, plus the layout normalization that now
+        # precedes them.
+        Mock Update-HostStorageCache { }
         Mock Initialize-Disk { }
         Mock New-Partition {
             [PSCustomObject]@{
@@ -246,6 +256,55 @@ Describe 'Invoke-SecureDiskErase -Reformat' {
             $result.Reformatted | Should -BeTrue
             $result.DriveLetter | Should -Be 'E'
             Should -Invoke Format-Volume -Times 1 -Exactly -ParameterFilter { "$DriveLetter" -eq 'E' }
+        }
+
+        It 'normalizes a phantom layout left behind by the overwrite' {
+            # Measured on real hardware 2026-09-09. After zeroing all 114.6 GB,
+            # Windows derived a layout from the all-zero sector 0 and reported
+            # PartitionStyle MBR with a full-disk FAT16 partition at offset 0 and
+            # LargestFreeExtent 0. The old code saw "MBR", assumed the disk was
+            # already initialized, skipped Initialize-Disk, and New-Partition died
+            # with "Not enough available capacity".
+            $script:clearedBeforeInit = $false
+            Mock Get-Disk {
+                if ($script:clearedBeforeInit) {
+                    [PSCustomObject]@{ Number = 1; Size = $script:diskSizeBytes; PartitionStyle = 'GPT'; LargestFreeExtent = $script:diskSizeBytes; AllocatedSize = 0 }
+                }
+                else {
+                    # The phantom: claims MBR, claims fully allocated, no free space.
+                    [PSCustomObject]@{ Number = 1; Size = $script:diskSizeBytes; PartitionStyle = 'MBR'; LargestFreeExtent = 0; AllocatedSize = $script:diskSizeBytes }
+                }
+            }
+            Mock Clear-Disk { $script:clearedBeforeInit = $true }
+
+            $result = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Reformat -Confirm:$false
+
+            # It must clear the phantom table and initialize anyway, rather than
+            # trusting the reported style and going straight to New-Partition.
+            Should -Invoke Initialize-Disk -Times 1 -Exactly
+            Should -Invoke New-Partition   -Times 1 -Exactly
+            $result.Reformatted | Should -BeTrue
+        }
+
+        It 'refreshes the cached layout before reading it' {
+            $null = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Reformat -Confirm:$false
+            Should -Invoke Update-HostStorageCache -Times 1 -Exactly
+        }
+
+        It 'names the real reason when there is genuinely no free extent' {
+            # A bare "Not enough available capacity" from New-Partition tells an
+            # operator nothing. If the disk still reports no room after being
+            # initialized, say that.
+            Mock Get-Disk {
+                [PSCustomObject]@{ Number = 1; Size = $script:diskSizeBytes; PartitionStyle = 'GPT'; LargestFreeExtent = 0; AllocatedSize = $script:diskSizeBytes }
+            }
+
+            $result = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Reformat -Confirm:$false
+
+            Should -Invoke New-Partition -Times 0
+            $result.Success         | Should -BeTrue
+            $result.Reformatted     | Should -BeFalse
+            $result.ReformatMessage | Should -Match 'no free extent'
         }
 
         It 'refuses to format when no drive letter was assigned at all' {
@@ -563,6 +622,34 @@ Describe 'Reformat wiring across the three entry points' {
     It 'the CLI exposes -Reformat and passes it through' {
         $script:cliSource | Should -Match '\[switch\]\$Reformat'
         $script:cliSource | Should -Match 'Invoke-SecureDiskErase[^\r\n]*-Reformat:\$Reformat'
+    }
+
+    It 'the GUI reports real progress, not just a marquee' {
+        # Standard now performs a full single-pass overwrite, so the default
+        # operation went from seconds to tens of minutes. A marquee bar with no
+        # numbers is indistinguishable from a hang, which is exactly the failure
+        # already flagged for the per-profile step of the user wipe.
+        $script:guiSource | Should -Match '\$script:progressState\s*=\s*\[hashtable\]::Synchronized'
+        $script:guiSource | Should -Match '-ReportProgress'
+        # Both long-running operations must feed it, not just one.
+        ([regex]::Matches($script:guiSource, '\$progress\.Percent\s*=')).Count |
+            Should -BeGreaterOrEqual 2
+    }
+
+    It 'the GUI distinguishes "no progress yet" from "0 percent"' {
+        # Percent is seeded to -1. Seeding it to 0 would show a determinate bar
+        # pinned at zero before the worker has said anything, which reads as
+        # stalled rather than starting.
+        $script:guiSource | Should -Match 'Percent\s*=\s*-1'
+        $script:guiSource | Should -Match '\$pct -ge 0'
+    }
+
+    It 'the GUI worker never touches the form from the background runspace' {
+        # A shared hashtable is the only legal channel. Touching a control from the
+        # worker runspace throws a cross-thread exception at best.
+        foreach ($m in [regex]::Matches($script:guiSource, '(?s)\$script:ps\.AddScript\(\{.*?\}\)\.AddArgument')) {
+            $m.Value | Should -Not -Match '\$progressBar|\$lblProgress|\$form'
+        }
     }
 
     It 'the CLI explains the raw disk too' {

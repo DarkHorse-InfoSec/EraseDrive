@@ -105,6 +105,18 @@ function Start-EraseDriveGUI {
     $script:operationType = $null
     $script:operationStart = $null
 
+    # The operation runs in a background runspace, so progress cannot be written to
+    # the form directly. A synchronized hashtable is a reference type shared across
+    # runspaces in this process: the worker writes, the poll timer reads on the UI
+    # thread. This matters because the default erase method performs a full
+    # single-pass overwrite; on a 114 GB disk that is twenty minutes or more, and
+    # a marquee bar with no numbers is indistinguishable from a hang.
+    $script:progressState = [hashtable]::Synchronized(@{
+        Percent   = -1
+        Status    = $null
+        Operation = $null
+    })
+
     # ── Load logo image ───────────────────────────────────────────────────────
     $script:logoImage = $null
     $logoCandidates = @(
@@ -626,6 +638,9 @@ function Start-EraseDriveGUI {
         $script:operationRunning = $true
         $script:operationType    = $opType
         $script:operationStart   = [DateTime]::Now
+        $script:progressState.Percent   = -1
+        $script:progressState.Status    = $null
+        $script:progressState.Operation = $null
         $btnUserWipe.Enabled     = $false
         $btnEraseDisk.Enabled    = $false
         $btnRefresh.Enabled      = $false
@@ -700,11 +715,28 @@ function Start-EraseDriveGUI {
     $pollTimer.Add_Tick({
         if ($null -eq $script:asyncResult) { return }
 
-        # Update elapsed time display
+        # Update elapsed time and, once the worker reports a real percentage,
+        # switch the bar from marquee to a determinate value. Percent stays -1 until
+        # the first callback arrives, which is what distinguishes "no news yet" from
+        # "genuinely at 0%".
         if ($null -ne $script:operationStart) {
             $elapsed    = [DateTime]::Now - $script:operationStart
             $elapsedStr = '{0:hh\:mm\:ss}' -f $elapsed
-            $lblProgress.Text = "$($script:operationType) -- Elapsed: $elapsedStr"
+
+            $pct = $script:progressState.Percent
+            if ($null -ne $pct -and $pct -ge 0) {
+                if ($progressBar.Style -ne 'Blocks') { $progressBar.Style = 'Blocks' }
+                $clamped = [Math]::Max(0, [Math]::Min(100, [int]$pct))
+                if ($progressBar.Value -ne $clamped) { $progressBar.Value = $clamped }
+
+                $stageText = $script:progressState.Status
+                $opText    = $script:progressState.Operation
+                $detail    = if ($opText) { "$stageText -- $opText" } else { $stageText }
+                $lblProgress.Text = "$($script:operationType) [$clamped%] $detail -- Elapsed: $elapsedStr"
+            }
+            else {
+                $lblProgress.Text = "$($script:operationType) -- Elapsed: $elapsedStr"
+            }
         }
 
         if ($script:asyncResult.IsCompleted) {
@@ -874,10 +906,17 @@ function Start-EraseDriveGUI {
 
         $script:ps = [PowerShell]::Create()
         $script:ps.AddScript({
-            param($modPath, $wipeMethod, $doClearLogs)
+            param($modPath, $wipeMethod, $doClearLogs, $progress)
             Import-Module $modPath -Force
-            Invoke-ForensicUserDataWipe -WipeMethod $wipeMethod -ClearEventLogs:$doClearLogs -Confirm:$false
-        }).AddArgument($modulePath).AddArgument($method).AddArgument($clearLogs) | Out-Null
+            Invoke-ForensicUserDataWipe -WipeMethod $wipeMethod -ClearEventLogs:$doClearLogs -Confirm:$false -ReportProgress {
+                param($info)
+                # Profile removal can sit on a single step for a long time. Without
+                # this the operator sees only a marquee and assumes a hang.
+                $progress.Percent   = $info.PercentComplete
+                $progress.Status    = $info.Status
+                $progress.Operation = $info.CurrentOperation
+            }
+        }).AddArgument($modulePath).AddArgument($method).AddArgument($clearLogs).AddArgument($script:progressState) | Out-Null
 
         $script:asyncResult = $script:ps.BeginInvoke()
         $pollTimer.Start()
@@ -1005,10 +1044,17 @@ function Start-EraseDriveGUI {
 
         $script:ps = [PowerShell]::Create()
         $script:ps.AddScript({
-            param($modPath, $dNum, $eraseMethod, $doReformat)
+            param($modPath, $dNum, $eraseMethod, $doReformat, $progress)
             Import-Module $modPath -Force
-            Invoke-SecureDiskErase -DiskNumber $dNum -EraseMethod $eraseMethod -Reformat:$doReformat -Confirm:$false
-        }).AddArgument($modulePath).AddArgument($diskNum).AddArgument($method).AddArgument($reformat) | Out-Null
+            Invoke-SecureDiskErase -DiskNumber $dNum -EraseMethod $eraseMethod -Reformat:$doReformat -Confirm:$false -ReportProgress {
+                param($info)
+                # Writing into the shared hashtable is the only cross-runspace
+                # communication here. Never touch the form from this runspace.
+                $progress.Percent   = $info.PercentComplete
+                $progress.Status    = $info.Status
+                $progress.Operation = $info.CurrentOperation
+            }
+        }).AddArgument($modulePath).AddArgument($diskNum).AddArgument($method).AddArgument($reformat).AddArgument($script:progressState) | Out-Null
 
         $script:asyncResult = $script:ps.BeginInvoke()
         $pollTimer.Start()

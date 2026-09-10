@@ -189,12 +189,26 @@ function Invoke-SecureDiskErase {
     # commonest success case and would silently skip verification.
     $finalPattern = $null
 
-    # Helper to invoke progress callback safely
+    # Helper to invoke the caller's progress callback safely.
+    #
+    # The name here is deliberate and was learned the hard way.
+    #
+    # The callback is captured into $callerProgress, a name that exists nowhere
+    # else in this module. `$ReportProgress` is the parameter name of BOTH this
+    # function and Invoke-SecureOverwrite, and a scriptblock invoked with & from
+    # inside the other function resolves that name in the wrong scope: the
+    # caller's callback silently never fires. Reproduced in isolation before
+    # changing anything.
+    #
+    # Confirmed working in a real run after the rename: the operator sees
+    # "[ 41%] Overwriting disk - Pass 1 of 1" while the overwrite is in flight.
+    # Do not rename $callerProgress back to $ReportProgress.
+    $callerProgress = $ReportProgress
     $reportStep = {
         param([int]$Percent, [string]$Status, [string]$Operation)
-        if ($ReportProgress) {
+        if ($null -ne $callerProgress) {
             try {
-                & $ReportProgress @{
+                & $callerProgress @{
                     PercentComplete  = $Percent
                     Status           = $Status
                     CurrentOperation = $Operation
@@ -661,29 +675,29 @@ function Invoke-SecureDiskErase {
             }
             else {
 
-            & $reportStep 75 'Verifying erasure' 'Post-erase sector sampling'
-            Write-OperationLog -Message "Starting post-erase verification for disk $DiskNumber against expected byte 0x$($finalPattern.ToString('X2'))" -LogLevel 'INFO'
+                & $reportStep 75 'Verifying erasure' 'Post-erase sector sampling'
+                Write-OperationLog -Message "Starting post-erase verification for disk $DiskNumber against expected byte 0x$($finalPattern.ToString('X2'))" -LogLevel 'INFO'
 
-            try {
-                # The expected pattern is not a constant here. It is the byte the
-                # erase actually wrote, carried through from the method that wrote
-                # it. Hardcoding 0x00 at this call site while a method wrote
-                # something else is the defect this parameter exists to prevent.
-                $verificationResult = Test-EraseVerification -DiskNumber $DiskNumber -ExpectedPattern $finalPattern
+                try {
+                    # The expected pattern is not a constant here. It is the byte the
+                    # erase actually wrote, carried through from the method that wrote
+                    # it. Hardcoding 0x00 at this call site while a method wrote
+                    # something else is the defect this parameter exists to prevent.
+                    $verificationResult = Test-EraseVerification -DiskNumber $DiskNumber -ExpectedPattern $finalPattern
 
-                if ($verificationResult.Verified) {
-                    $verified = $true
-                    Write-OperationLog -Message "Verification PASSED: $($verificationResult.SamplesPassed)/$($verificationResult.SamplesChecked) samples clean ($($verificationResult.Duration))" -LogLevel 'SUCCESS'
+                    if ($verificationResult.Verified) {
+                        $verified = $true
+                        Write-OperationLog -Message "Verification PASSED: $($verificationResult.SamplesPassed)/$($verificationResult.SamplesChecked) samples clean ($($verificationResult.Duration))" -LogLevel 'SUCCESS'
+                    }
+                    else {
+                        Write-OperationLog -Message "Verification FAILED: $($verificationResult.SamplesFailed)/$($verificationResult.SamplesChecked) samples still contain data. $($verificationResult.Message)" -LogLevel 'WARNING'
+                    }
                 }
-                else {
-                    Write-OperationLog -Message "Verification FAILED: $($verificationResult.SamplesFailed)/$($verificationResult.SamplesChecked) samples still contain data. $($verificationResult.Message)" -LogLevel 'WARNING'
+                catch {
+                    Write-OperationLog -Message "Verification error: $($_.Exception.Message)" -LogLevel 'WARNING'
                 }
-            }
-            catch {
-                Write-OperationLog -Message "Verification error: $($_.Exception.Message)" -LogLevel 'WARNING'
-            }
 
-            & $reportStep 85 'Verification complete' $(if ($verified) { 'Erase verified' } else { 'Verification did not pass' })
+                & $reportStep 85 'Verification complete' $(if ($verified) { 'Erase verified' } else { 'Verification did not pass' })
 
             }
         }
@@ -733,13 +747,53 @@ function Invoke-SecureDiskErase {
                     # hot-plug between erase and reformat would format a different disk.
                     & $assertDiskIdentity
 
-                    $currentStyle = "$((Get-Disk -Number $DiskNumber -ErrorAction Stop).PartitionStyle)"
-                    if ([string]::IsNullOrWhiteSpace($currentStyle) -or $currentStyle -eq 'RAW') {
-                        Write-OperationLog -Message "Initializing disk $DiskNumber as $ReformatPartitionStyle" -LogLevel 'INFO'
-                        Initialize-Disk -Number $DiskNumber -PartitionStyle $ReformatPartitionStyle -Confirm:$false -ErrorAction Stop
+                    # Do NOT trust the partition layout Windows reports here, and do
+                    # NOT skip initialization because it claims to already have one.
+                    #
+                    # The erase just wrote zeros over every sector, sector 0 included.
+                    # Windows then derives a layout from that all-zero boot sector and
+                    # reports nonsense: measured on a 114.6 GB stick it came back as
+                    # PartitionStyle MBR with a FAT16 partition of the full disk size
+                    # at offset 0, and LargestFreeExtent of 0. An earlier version of
+                    # this code saw "MBR", concluded the disk was already initialized,
+                    # skipped Initialize-Disk, and New-Partition then failed with
+                    # "Not enough available capacity" because by that phantom layout
+                    # there was no free space left.
+                    #
+                    # So normalize unconditionally: refresh the cached layout, clear
+                    # whatever table is claimed to be there, then initialize. Clearing
+                    # is safe and cheap at this point: the media is already zeroed and
+                    # verification has already passed.
+                    try { Update-HostStorageCache -ErrorAction Stop }
+                    catch { Write-OperationLog -Message "Could not refresh the storage cache before reformat: $($_.Exception.Message)" -LogLevel 'WARNING' }
+
+                    $reportedStyle = "$((Get-Disk -Number $DiskNumber -ErrorAction Stop).PartitionStyle)"
+                    Write-OperationLog -Message "Disk $DiskNumber reports PartitionStyle '$reportedStyle' after the overwrite; normalizing before partitioning." -LogLevel 'INFO'
+
+                    if ($reportedStyle -ne 'RAW' -and -not [string]::IsNullOrWhiteSpace($reportedStyle)) {
+                        & $assertDiskIdentity
+                        # Drop the phantom table. Tolerate failure: on a genuinely raw
+                        # disk Clear-Disk has nothing to do and may object, which is
+                        # not an error for our purposes.
+                        try {
+                            Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
+                            Write-OperationLog -Message "Cleared the stale partition table on disk $DiskNumber" -LogLevel 'INFO'
+                        }
+                        catch {
+                            Write-OperationLog -Message "Clear-Disk before reformat reported: $($_.Exception.Message). Continuing; the disk may already be raw." -LogLevel 'INFO'
+                        }
                     }
-                    else {
-                        Write-OperationLog -Message "Disk $DiskNumber already reports PartitionStyle '$currentStyle'; skipping Initialize-Disk" -LogLevel 'INFO'
+
+                    & $assertDiskIdentity
+                    Write-OperationLog -Message "Initializing disk $DiskNumber as $ReformatPartitionStyle" -LogLevel 'INFO'
+                    Initialize-Disk -Number $DiskNumber -PartitionStyle $ReformatPartitionStyle -Confirm:$false -ErrorAction Stop
+
+                    # Confirm there is actually room before asking for the maximum size,
+                    # so a failure names the real reason instead of surfacing a bare
+                    # "Not enough available capacity".
+                    $postInit = Get-Disk -Number $DiskNumber -ErrorAction Stop
+                    if ($postInit.LargestFreeExtent -le 0) {
+                        throw "after initializing as $ReformatPartitionStyle the disk still reports no free extent (allocated $($postInit.AllocatedSize) of $($postInit.Size) bytes), so no partition can be created."
                     }
 
                     & $assertDiskIdentity

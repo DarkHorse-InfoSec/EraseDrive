@@ -225,6 +225,27 @@ Exit codes: `0` wipe complete, `2` succeeded but remnants remain (see the printe
     -Reformat -ReformatFileSystem exFAT -ReformatLabel RECOVERED
 ```
 
+### Safety: which disks EraseDrive refuses
+
+A disk erase is refused, with the reason reported, when the disk is offline, is the
+system or boot disk, reports anything other than Healthy, carries a system,
+reserved or recovery partition, holds a Windows installation or Program Files on
+any mounted volume, or is part of a Storage Space or RAID array.
+
+It is also refused when **the disk holds EraseDrive itself or the current working
+directory**. EraseDrive is designed to be run from removable media, and a plain
+data stick trips none of the checks above: it is not the system disk, not the boot
+disk, is healthy, has no `\Windows`, and has no reserved partition. Erasing it
+would destroy the running tool part way through the operation. If the tool cannot
+determine which disk it is running from, it says so in the safety reason rather
+than treating the unknown as safe.
+
+Before any destructive step, and again before each write of an optional reformat,
+the target disk's serial number is re-checked against the one recorded at the
+start. A disk that changed identity mid-operation, which is what a hot-plug looks
+like, aborts the operation rather than continuing on whatever now occupies that
+disk number.
+
 ### Erase methods, and what each one actually does
 
 | Method | What it does | Compliance |

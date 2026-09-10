@@ -351,7 +351,17 @@ function Invoke-ForensicUserDataWipe {
         $stopwatch.Stop()
         & $reportStep 100 'Complete' 'Forensic wipe finished'
 
-        $message = "Forensic user data wipe completed successfully. $($profilesRemoved.Count) profile(s) removed."
+        # "Completed successfully" with nothing removed is the same false-positive
+        # shape that let the disk erase certify a wipe it never performed. A run
+        # that skipped every profile has destroyed no user data, and the summary
+        # that ends up in front of an operator has to say so.
+        $message = "Forensic user data wipe completed. $($profilesRemoved.Count) profile(s) removed."
+        if ($profilesSkipped.Count -gt 0) {
+            $message += " $($profilesSkipped.Count) profile(s) SKIPPED and left intact: $($profilesSkipped -join ', ')."
+        }
+        if ($profilesRemoved.Count -eq 0) {
+            $message += ' WARNING: no user profiles were removed, so no user data was destroyed by this operation.'
+        }
         Write-OperationLog -Message $message -LogLevel 'SUCCESS'
         Write-AuditLog -EventType 'OperationCompleted' -Message $message -TargetDescription 'System drive user data'
 

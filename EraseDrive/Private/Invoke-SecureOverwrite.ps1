@@ -45,7 +45,11 @@ function Invoke-SecureOverwrite {
 
     .OUTPUTS
         PSCustomObject with properties: Success, BytesOverwritten, PassesCompleted,
-        Duration, Message, FinalPattern.
+        PassesFailed, Duration, Message, FinalPattern.
+
+        Success is $true only when every pass ran, none failed, AND bytes actually
+        reached the media. An overwrite that writes nothing has sanitized nothing,
+        however cleanly its loop exited.
 
         FinalPattern is the byte this run last wrote across the target, and is what
         a subsequent verification must expect. It is $null when the disk was left
@@ -73,6 +77,7 @@ function Invoke-SecureOverwrite {
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $totalBytesOverwritten = [int64]0
     $passesCompleted = 0
+    $passesFailed = 0
     $bufferSize = 1MB                    # 1 MB write buffer
     $chunkSize  = 512MB                  # 512 MB temp file chunks for free-space mode
     $isPhysicalDisk = $TargetPath -match '^\\\\.\\PhysicalDrive\d+$'
@@ -137,13 +142,40 @@ function Invoke-SecureOverwrite {
         }
 
         if ($totalBytes -le 0) {
-            $msg = "Target '$TargetPath' reports 0 bytes available -- nothing to overwrite."
+            # Two very different situations produce 0 here, and they must not share
+            # an answer.
+            #
+            # A whole physical disk NEVER legitimately has 0 bytes. Reaching this
+            # with a PhysicalDrive target means the size query failed or returned
+            # nothing, so we do not know how much to write and have written none of
+            # it. Reporting success there is reporting a sanitization that did not
+            # happen.
+            #
+            # A drive-letter target in free-space mode genuinely can have 0 bytes
+            # free, and there really is nothing to do.
+            if ($isPhysicalDisk) {
+                $msg = "Could not determine the size of '$TargetPath' (reported $totalBytes bytes). Refusing to report a successful overwrite of a disk whose size is unknown; nothing was written."
+                Write-OperationLog -Message $msg -LogLevel 'Error'
+                $stopwatch.Stop()
+                return [PSCustomObject]@{
+                    Success          = $false
+                    BytesOverwritten = [int64]0
+                    PassesCompleted  = 0
+                    PassesFailed     = $Passes
+                    Duration         = $stopwatch.Elapsed
+                    Message          = $msg
+                    FinalPattern     = $null
+                }
+            }
+
+            $msg = "Target '$TargetPath' reports 0 bytes of free space -- nothing to overwrite."
             Write-OperationLog -Message $msg -LogLevel 'Warning'
             $stopwatch.Stop()
             return [PSCustomObject]@{
                 Success          = $true
                 BytesOverwritten = [int64]0
                 PassesCompleted  = 0
+                PassesFailed     = 0
                 Duration         = $stopwatch.Elapsed
                 Message          = $msg
                 FinalPattern     = $null
@@ -155,34 +187,59 @@ function Invoke-SecureOverwrite {
         # ------------------------------------------------------------------
         $rng = [System.Security.Cryptography.RNGCryptoServiceProvider]::new()
 
+        # Fill a buffer with the pass pattern.
+        #
+        # Every branch here MUST avoid a per-byte PowerShell loop. The original
+        # version assigned $Buffer[$i] one byte at a time, which is about a million
+        # interpreted iterations per megabyte; across a 114.6 GB disk that is on the
+        # order of 10^11 iterations, or many hours of CPU before a single sector is
+        # written. [Array]::Clear and [Array]::Copy do the same work in native code.
+        #
+        # The doubling copy fills an arbitrary repeating pattern in log2(n) steps:
+        # seed the first unit, then repeatedly copy everything written so far to the
+        # end, doubling the filled length each time.
         function Fill-Buffer {
             param([byte[]]$Buffer, [string]$Pattern)
 
             if ($Pattern -eq 'RANDOM') {
                 $rng.GetBytes($Buffer)
+                return
             }
-            elseif ($Pattern -match '^0x([0-9A-Fa-f]{1,2})$') {
+
+            if ($Pattern -match '^0x([0-9A-Fa-f]{1,2})$') {
                 $byteVal = [byte][Convert]::ToInt32($Matches[1], 16)
-                for ($i = 0; $i -lt $Buffer.Length; $i++) {
-                    $Buffer[$i] = $byteVal
-                }
-            }
-            else {
-                # Treat the whole string as a repeating byte sequence
-                $hexClean = $Pattern -replace '0x|[^0-9A-Fa-f]', ''
-                if ($hexClean.Length -ge 2) {
-                    $patBytes = [byte[]]::new($hexClean.Length / 2)
-                    for ($j = 0; $j -lt $patBytes.Length; $j++) {
-                        $patBytes[$j] = [Convert]::ToByte($hexClean.Substring($j * 2, 2), 16)
-                    }
-                    for ($i = 0; $i -lt $Buffer.Length; $i++) {
-                        $Buffer[$i] = $patBytes[$i % $patBytes.Length]
-                    }
-                }
-                else {
-                    # Fallback: zero-fill
+                if ($byteVal -eq 0) {
                     [Array]::Clear($Buffer, 0, $Buffer.Length)
+                    return
                 }
+                $Buffer[0] = $byteVal
+                $filled = 1
+                while ($filled -lt $Buffer.Length) {
+                    $copy = [int][Math]::Min([int64]$filled, [int64]($Buffer.Length - $filled))
+                    [Array]::Copy($Buffer, 0, $Buffer, $filled, $copy)
+                    $filled += $copy
+                }
+                return
+            }
+
+            # Treat the whole string as a repeating byte sequence.
+            $hexClean = $Pattern -replace '0x|[^0-9A-Fa-f]', ''
+            if ($hexClean.Length -lt 2) {
+                [Array]::Clear($Buffer, 0, $Buffer.Length)
+                return
+            }
+
+            $patBytes = [byte[]]::new([int]($hexClean.Length / 2))
+            for ($j = 0; $j -lt $patBytes.Length; $j++) {
+                $patBytes[$j] = [Convert]::ToByte($hexClean.Substring($j * 2, 2), 16)
+            }
+            $seed = [int][Math]::Min([int64]$patBytes.Length, [int64]$Buffer.Length)
+            [Array]::Copy($patBytes, 0, $Buffer, 0, $seed)
+            $filled = $seed
+            while ($filled -lt $Buffer.Length) {
+                $copy = [int][Math]::Min([int64]$filled, [int64]($Buffer.Length - $filled))
+                [Array]::Copy($Buffer, 0, $Buffer, $filled, $copy)
+                $filled += $copy
             }
         }
 
@@ -199,6 +256,18 @@ function Invoke-SecureOverwrite {
             $passBytesWritten = [int64]0
             $passFailed = $false
 
+            # A fixed pattern produces the same bytes every time, so fill the buffer
+            # ONCE for the pass. Only RANDOM has to be regenerated per write, and
+            # that is the whole reason the original code refilled every iteration.
+            $needsRefillEachWrite = ($pattern -eq 'RANDOM')
+            Fill-Buffer -Buffer $buffer -Pattern $pattern
+
+            # Report on whole-percent changes only. At a 1 MB buffer a 114.6 GB
+            # disk is ~117,000 writes, and invoking the caller's callback on every
+            # one of them is both wasteful and a needless amount of script nesting
+            # inside the hottest loop in the product.
+            $lastReportedPct = -1
+
             try {
                 if ($isPhysicalDisk) {
                     # ---- Physical disk raw write ----
@@ -211,23 +280,44 @@ function Invoke-SecureOverwrite {
 
                     try {
                         while ($passBytesWritten -lt $totalBytes) {
-                            $remaining = $totalBytes - $passBytesWritten
-                            $writeLen  = [Math]::Min($buffer.Length, $remaining)
+                            $remaining = [int64]($totalBytes - $passBytesWritten)
+                            # Both arguments MUST be [int64]. PowerShell picks the
+                            # [Math]::Min overload from the first argument's type, so
+                            # an Int32 buffer length selects Min(int,int) and then
+                            # throws converting a multi-gigabyte remainder. That threw
+                            # on the first iteration of every disk over 2 GB, which is
+                            # every disk this tool exists to erase.
+                            $writeLen  = [int64][Math]::Min([int64]$buffer.Length, $remaining)
 
-                            # Re-fill buffer (important for RANDOM -- need fresh data each iteration)
-                            Fill-Buffer -Buffer $buffer -Pattern $pattern
+                            # Only RANDOM needs fresh bytes per write; a fixed
+                            # pattern was filled once before the loop.
+                            if ($needsRefillEachWrite) { Fill-Buffer -Buffer $buffer -Pattern $pattern }
 
                             $stream.Write($buffer, 0, [int]$writeLen)
                             $passBytesWritten += $writeLen
 
                             if ($ReportProgress) {
-                                $pct = [Math]::Round(($passBytesWritten / $totalBytes) * 100, 1)
-                                & $ReportProgress @{
-                                    Pass            = $pass
-                                    TotalPasses     = $Passes
-                                    BytesWritten    = $passBytesWritten
-                                    TotalBytes      = $totalBytes
-                                    PercentComplete = $pct
+                                $pct = [int][Math]::Floor(($passBytesWritten / $totalBytes) * 100)
+                                if ($pct -ne $lastReportedPct) {
+                                    $lastReportedPct = $pct
+                                    # Log directly as well as calling back. The
+                                    # callback reaches the caller through a
+                                    # scriptblock whose variable lookup is
+                                    # currently unreliable (see the note in
+                                    # Invoke-SecureDiskErase), and an operator
+                                    # watching a multi-hour write needs SOME
+                                    # evidence of movement that does not depend on
+                                    # that path working.
+                                    if (($pct % 5) -eq 0) {
+                                        Write-OperationLog -Message "Pass $pass/$Passes on '$TargetPath': $pct% ($passBytesWritten of $totalBytes bytes)" -LogLevel 'Info'
+                                    }
+                                    & $ReportProgress @{
+                                        Pass            = $pass
+                                        TotalPasses     = $Passes
+                                        BytesWritten    = $passBytesWritten
+                                        TotalBytes      = $totalBytes
+                                        PercentComplete = $pct
+                                    }
                                 }
                             }
                         }
@@ -266,8 +356,8 @@ function Invoke-SecureOverwrite {
 
                                 try {
                                     while ($chunkBytesWritten -lt $chunkSize) {
-                                        $writeLen = [Math]::Min($buffer.Length, ($chunkSize - $chunkBytesWritten))
-                                        Fill-Buffer -Buffer $buffer -Pattern $pattern
+                                        $writeLen = [int64][Math]::Min([int64]$buffer.Length, [int64]($chunkSize - $chunkBytesWritten))
+                                        if ($needsRefillEachWrite) { Fill-Buffer -Buffer $buffer -Pattern $pattern }
 
                                         $stream.Write($buffer, 0, [int]$writeLen)
                                         $chunkBytesWritten += $writeLen
@@ -314,29 +404,53 @@ function Invoke-SecureOverwrite {
                 Write-OperationLog -Message "Pass $pass/$Passes complete -- $passBytesWritten bytes written." -LogLevel 'Info'
             }
             catch {
-                $passesCompleted++
+                # A pass that threw is NOT a completed pass. Counting it as one is
+                # how this function came to report Success after writing 0 bytes.
+                $passesFailed++
                 $totalBytesOverwritten += $passBytesWritten
-                Write-OperationLog -Message "Pass $pass/$Passes failed after $passBytesWritten bytes: $_" -LogLevel 'Error'
-                # Continue to next pass per spec -- do not abort
+                Write-OperationLog -Message "Pass $pass/$Passes FAILED after $passBytesWritten bytes: $_" -LogLevel 'Error'
+                # Continue to the next pass rather than aborting, but the failure is
+                # now recorded and will be reflected in Success and FinalPattern.
             }
         }
 
         $rng.Dispose()
         $stopwatch.Stop()
 
-        $resultMsg = "Secure overwrite completed: $passesCompleted/$Passes passes, $totalBytesOverwritten bytes overwritten."
-        Write-OperationLog -Message $resultMsg -LogLevel 'Info'
+        # Success requires three things, and the third is the one that was missing:
+        # every pass ran, none of them failed, and bytes actually reached the media.
+        # An overwrite that wrote nothing is not a successful overwrite, however
+        # cleanly the loop exited.
+        $allPassesCompleted = ($passesCompleted -eq $Passes -and $passesFailed -eq 0)
+        $wroteSomething     = ($totalBytes -le 0) -or ($totalBytesOverwritten -gt 0)
+        $overwriteSucceeded = ($allPassesCompleted -and $wroteSomething)
 
-        # Only claim a final pattern if every pass actually finished. A partial run
-        # leaves a mix of patterns on the media, which is exactly the state that must
-        # NOT be reported as verifiable.
-        $allPassesCompleted = ($passesCompleted -eq $Passes)
-        $finalPattern = if ($allPassesCompleted) { $plannedFinalPattern } else { $null }
+        if (-not $wroteSomething) {
+            Write-OperationLog -Message "Secure overwrite wrote 0 of $totalBytes bytes to '$TargetPath'. Reporting FAILURE: a pass that writes nothing has sanitized nothing." -LogLevel 'Error'
+        }
+        if ($passesFailed -gt 0) {
+            Write-OperationLog -Message "$passesFailed of $Passes pass(es) failed on '$TargetPath'." -LogLevel 'Error'
+        }
+
+        $resultMsg = if ($overwriteSucceeded) {
+            "Secure overwrite completed: $passesCompleted/$Passes passes, $totalBytesOverwritten bytes overwritten."
+        }
+        else {
+            "Secure overwrite FAILED on '$TargetPath': $passesCompleted/$Passes passes completed, $passesFailed failed, $totalBytesOverwritten of $totalBytes bytes written."
+        }
+        Write-OperationLog -Message $resultMsg -LogLevel $(if ($overwriteSucceeded) { 'Info' } else { 'Error' })
+
+        # Only claim a final pattern if the media really was written end to end. A
+        # partial or failed run leaves a mix, which must NOT be reported as
+        # verifiable: doing so hands the verifier a pattern to confirm that the disk
+        # was never given.
+        $finalPattern = if ($overwriteSucceeded) { $plannedFinalPattern } else { $null }
 
         return [PSCustomObject]@{
-            Success          = $allPassesCompleted
+            Success          = $overwriteSucceeded
             BytesOverwritten = $totalBytesOverwritten
             PassesCompleted  = $passesCompleted
+            PassesFailed     = $passesFailed
             Duration         = $stopwatch.Elapsed
             Message          = $resultMsg
             FinalPattern     = $finalPattern
@@ -352,6 +466,7 @@ function Invoke-SecureOverwrite {
             Success          = $false
             BytesOverwritten = $totalBytesOverwritten
             PassesCompleted  = $passesCompleted
+            PassesFailed     = $passesFailed
             Duration         = $stopwatch.Elapsed
             Message          = $errMsg
             # The run threw part way through, so the media holds an unknown mix.
