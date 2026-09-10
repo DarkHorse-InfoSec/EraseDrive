@@ -258,46 +258,62 @@ Describe 'Invoke-SecureDiskErase -Reformat' {
             Should -Invoke Format-Volume -Times 1 -Exactly -ParameterFilter { "$DriveLetter" -eq 'E' }
         }
 
-        It 'normalizes a phantom layout left behind by the overwrite' {
-            # Measured on real hardware 2026-09-09. After zeroing all 114.6 GB,
-            # Windows derived a layout from the all-zero sector 0 and reported
-            # PartitionStyle MBR with a full-disk FAT16 partition at offset 0 and
-            # LargestFreeExtent 0. The old code saw "MBR", assumed the disk was
-            # already initialized, skipped Initialize-Disk, and New-Partition died
-            # with "Not enough available capacity".
-            $script:clearedBeforeInit = $false
+        It 'breaks a phantom layout with diskpart rather than trusting Clear-Disk' {
+            # Measured on real hardware 2026-09-09/10. After zeroing all 114.6 GB,
+            # Windows reported PartitionStyle MBR with a full-disk FAT16 partition
+            # at offset 0 and LargestFreeExtent 0. Two approaches were tried
+            # against that real state and both failed: skipping initialization
+            # (New-Partition died with "Not enough available capacity"), and
+            # Clear-Disk (the partition API cannot delete a partition that does not
+            # really exist, and Initialize-Disk then refused with "The disk has
+            # already been initialized"). Only diskpart clean + convert worked.
+            $script:phantomBroken = $false
             Mock Get-Disk {
-                if ($script:clearedBeforeInit) {
+                if ($script:phantomBroken) {
                     [PSCustomObject]@{ Number = 1; Size = $script:diskSizeBytes; PartitionStyle = 'GPT'; LargestFreeExtent = $script:diskSizeBytes; AllocatedSize = 0 }
                 }
                 else {
-                    # The phantom: claims MBR, claims fully allocated, no free space.
                     [PSCustomObject]@{ Number = 1; Size = $script:diskSizeBytes; PartitionStyle = 'MBR'; LargestFreeExtent = 0; AllocatedSize = $script:diskSizeBytes }
                 }
             }
-            Mock Clear-Disk { $script:clearedBeforeInit = $true }
+            Mock Start-Sleep { }
+            # Stand in for diskpart. Invoking the real one in a test would be a
+            # destructive command against whatever disk 1 happens to be.
+            Mock diskpart { $script:phantomBroken = $true; 'DiskPart succeeded in cleaning the disk.'; $global:LASTEXITCODE = 0 }
 
             $result = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Reformat -Confirm:$false
 
-            # It must clear the phantom table and initialize anyway, rather than
-            # trusting the reported style and going straight to New-Partition.
+            Should -Invoke diskpart      -Times 1 -Exactly
+            Should -Invoke New-Partition -Times 1 -Exactly
+            $result.Reformatted | Should -BeTrue
+        }
+
+        It 'does not reach for diskpart when the disk is simply raw' {
+            # The ordinary case must stay ordinary. A guard that always shells out
+            # would pass the test above and be wrong.
+            Mock diskpart { throw 'diskpart must not run for a plainly raw disk' }
+
+            $result = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Reformat -Confirm:$false
+
             Should -Invoke Initialize-Disk -Times 1 -Exactly
-            Should -Invoke New-Partition   -Times 1 -Exactly
+            Should -Invoke diskpart        -Times 0
             $result.Reformatted | Should -BeTrue
         }
 
         It 'refreshes the cached layout before reading it' {
             $null = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Reformat -Confirm:$false
-            Should -Invoke Update-HostStorageCache -Times 1 -Exactly
+            Should -Invoke Update-HostStorageCache -Times 1
         }
 
         It 'names the real reason when there is genuinely no free extent' {
             # A bare "Not enough available capacity" from New-Partition tells an
-            # operator nothing. If the disk still reports no room after being
-            # initialized, say that.
+            # operator nothing. If the disk still reports no room after diskpart
+            # has rewritten the table, say exactly that.
             Mock Get-Disk {
                 [PSCustomObject]@{ Number = 1; Size = $script:diskSizeBytes; PartitionStyle = 'GPT'; LargestFreeExtent = 0; AllocatedSize = $script:diskSizeBytes }
             }
+            Mock Start-Sleep { }
+            Mock diskpart { 'DiskPart succeeded in cleaning the disk.'; $global:LASTEXITCODE = 0 }
 
             $result = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Reformat -Confirm:$false
 
@@ -305,6 +321,21 @@ Describe 'Invoke-SecureDiskErase -Reformat' {
             $result.Success         | Should -BeTrue
             $result.Reformatted     | Should -BeFalse
             $result.ReformatMessage | Should -Match 'no free extent'
+        }
+
+        It 'reports a diskpart failure instead of pressing on' {
+            Mock Get-Disk {
+                [PSCustomObject]@{ Number = 1; Size = $script:diskSizeBytes; PartitionStyle = 'MBR'; LargestFreeExtent = 0; AllocatedSize = $script:diskSizeBytes }
+            }
+            Mock Start-Sleep { }
+            Mock diskpart { 'Virtual Disk Service error'; $global:LASTEXITCODE = 1 }
+
+            $result = Invoke-SecureDiskErase -DiskNumber 1 -EraseMethod Standard -Reformat -Confirm:$false
+
+            Should -Invoke New-Partition -Times 0
+            $result.Success         | Should -BeTrue
+            $result.Reformatted     | Should -BeFalse
+            $result.ReformatMessage | Should -Match 'diskpart could not rewrite'
         }
 
         It 'refuses to format when no drive letter was assigned at all' {

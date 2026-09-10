@@ -747,53 +747,78 @@ function Invoke-SecureDiskErase {
                     # hot-plug between erase and reformat would format a different disk.
                     & $assertDiskIdentity
 
-                    # Do NOT trust the partition layout Windows reports here, and do
-                    # NOT skip initialization because it claims to already have one.
+                    # Do NOT trust the partition layout Windows reports here.
                     #
-                    # The erase just wrote zeros over every sector, sector 0 included.
-                    # Windows then derives a layout from that all-zero boot sector and
-                    # reports nonsense: measured on a 114.6 GB stick it came back as
-                    # PartitionStyle MBR with a FAT16 partition of the full disk size
-                    # at offset 0, and LargestFreeExtent of 0. An earlier version of
-                    # this code saw "MBR", concluded the disk was already initialized,
-                    # skipped Initialize-Disk, and New-Partition then failed with
-                    # "Not enough available capacity" because by that phantom layout
-                    # there was no free space left.
+                    # The erase just wrote zeros over every sector, sector 0
+                    # included. A fully zeroed sector 0 has no 55 AA signature, so
+                    # Windows falls back to superfloppy detection and invents a
+                    # whole-disk volume. Measured on a 114.6 GB stick: it came back
+                    # as PartitionStyle MBR with a FAT16 partition of the full disk
+                    # at offset 0 and LargestFreeExtent of 0.
                     #
-                    # So normalize unconditionally: refresh the cached layout, clear
-                    # whatever table is claimed to be there, then initialize. Clearing
-                    # is safe and cheap at this point: the media is already zeroed and
-                    # verification has already passed.
+                    # Two things were tried against that real state and FAILED:
+                    #   - skipping initialization because it "already" had a style,
+                    #     which made New-Partition die with "Not enough available
+                    #     capacity";
+                    #   - Clear-Disk, which cannot remove a partition that does not
+                    #     really exist, then Initialize-Disk refusing with "The disk
+                    #     has already been initialized".
+                    #
+                    # What works is diskpart: `clean` plus `convert`, which WRITES a
+                    # real partition table rather than asking the partition API to
+                    # delete an imaginary one. This module already shells to diskpart
+                    # for the SSD secure-erase paths, so it is not a new dependency.
                     try { Update-HostStorageCache -ErrorAction Stop }
                     catch { Write-OperationLog -Message "Could not refresh the storage cache before reformat: $($_.Exception.Message)" -LogLevel 'WARNING' }
 
-                    $reportedStyle = "$((Get-Disk -Number $DiskNumber -ErrorAction Stop).PartitionStyle)"
-                    Write-OperationLog -Message "Disk $DiskNumber reports PartitionStyle '$reportedStyle' after the overwrite; normalizing before partitioning." -LogLevel 'INFO'
+                    $layout = Get-Disk -Number $DiskNumber -ErrorAction Stop
+                    Write-OperationLog -Message "Disk $DiskNumber after overwrite: style '$($layout.PartitionStyle)', largest free extent $($layout.LargestFreeExtent) bytes." -LogLevel 'INFO'
 
-                    if ($reportedStyle -ne 'RAW' -and -not [string]::IsNullOrWhiteSpace($reportedStyle)) {
+                    if ("$($layout.PartitionStyle)" -eq 'RAW') {
                         & $assertDiskIdentity
-                        # Drop the phantom table. Tolerate failure: on a genuinely raw
-                        # disk Clear-Disk has nothing to do and may object, which is
-                        # not an error for our purposes.
-                        try {
-                            Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
-                            Write-OperationLog -Message "Cleared the stale partition table on disk $DiskNumber" -LogLevel 'INFO'
-                        }
-                        catch {
-                            Write-OperationLog -Message "Clear-Disk before reformat reported: $($_.Exception.Message). Continuing; the disk may already be raw." -LogLevel 'INFO'
-                        }
+                        Write-OperationLog -Message "Initializing disk $DiskNumber as $ReformatPartitionStyle" -LogLevel 'INFO'
+                        Initialize-Disk -Number $DiskNumber -PartitionStyle $ReformatPartitionStyle -Confirm:$false -ErrorAction Stop
+                        try { Update-HostStorageCache -ErrorAction Stop } catch { }
+                        $layout = Get-Disk -Number $DiskNumber -ErrorAction Stop
                     }
 
-                    & $assertDiskIdentity
-                    Write-OperationLog -Message "Initializing disk $DiskNumber as $ReformatPartitionStyle" -LogLevel 'INFO'
-                    Initialize-Disk -Number $DiskNumber -PartitionStyle $ReformatPartitionStyle -Confirm:$false -ErrorAction Stop
+                    if ($layout.LargestFreeExtent -le 0) {
+                        # A disk that claims a style but offers no free extent is the
+                        # phantom. Break it with diskpart.
+                        Write-OperationLog -Message "Disk $DiskNumber reports style '$($layout.PartitionStyle)' with no free extent; rewriting the partition table with diskpart clean + convert $ReformatPartitionStyle." -LogLevel 'WARNING'
 
-                    # Confirm there is actually room before asking for the maximum size,
-                    # so a failure names the real reason instead of surfacing a bare
-                    # "Not enough available capacity".
-                    $postInit = Get-Disk -Number $DiskNumber -ErrorAction Stop
-                    if ($postInit.LargestFreeExtent -le 0) {
-                        throw "after initializing as $ReformatPartitionStyle the disk still reports no free extent (allocated $($postInit.AllocatedSize) of $($postInit.Size) bytes), so no partition can be created."
+                        # diskpart selects by NUMBER, so re-assert identity in the
+                        # smallest possible window before handing over.
+                        & $assertDiskIdentity
+
+                        $dpScript = Join-Path $env:TEMP "reformat_disk_$DiskNumber.txt"
+                        @(
+                            "select disk $DiskNumber"
+                            'clean'
+                            "convert $($ReformatPartitionStyle.ToLower())"
+                        ) | Set-Content -Path $dpScript -Encoding ASCII -Force
+
+                        $dpOut = & diskpart /s $dpScript 2>&1
+                        $dpCode = $LASTEXITCODE
+                        Remove-Item $dpScript -Force -ErrorAction SilentlyContinue
+
+                        if ($dpCode -ne 0) {
+                            throw "diskpart could not rewrite the partition table (exit $dpCode): $(($dpOut -join ' ').Trim())"
+                        }
+                        Write-OperationLog -Message "diskpart rewrote the partition table on disk $DiskNumber" -LogLevel 'INFO'
+
+                        Start-Sleep -Seconds 2
+                        try { Update-HostStorageCache -ErrorAction Stop } catch { }
+
+                        # The identity check after diskpart is not optional: it is the
+                        # only thing that catches a disk number having shifted while
+                        # diskpart held the device.
+                        & $assertDiskIdentity
+                        $layout = Get-Disk -Number $DiskNumber -ErrorAction Stop
+                    }
+
+                    if ($layout.LargestFreeExtent -le 0) {
+                        throw "the disk still reports no free extent after being reinitialized (style '$($layout.PartitionStyle)', allocated $($layout.AllocatedSize) of $($layout.Size) bytes), so no partition can be created."
                     }
 
                     & $assertDiskIdentity

@@ -82,7 +82,28 @@ function Set-EraseDriveEvidenceRoot {
 
             $probe = Join-Path $Candidate ('.ed_write_probe_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
             Set-Content -LiteralPath $probe -Value 'probe' -ErrorAction Stop -WhatIf:$false
-            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue -WhatIf:$false
+
+            # Clean up in a finally-equivalent, and retry once. A probe that is
+            # created but not removed leaves litter in a directory the operator did
+            # not ask us to write to, and 42 of them accumulated before anyone
+            # noticed, because the removal suppressed its own failure. A delete
+            # immediately after a create can lose a race with an antivirus scanner
+            # holding the new file, so one retry is worth more than one attempt.
+            for ($attempt = 1; $attempt -le 2; $attempt++) {
+                if (-not (Test-Path -LiteralPath $probe)) { break }
+                try {
+                    Remove-Item -LiteralPath $probe -Force -ErrorAction Stop -WhatIf:$false
+                    break
+                }
+                catch {
+                    if ($attempt -eq 2) {
+                        Write-OperationLog -Message "Could not remove the writability probe '$probe': $($_.Exception.Message). It will be left behind." -LogLevel 'WARNING'
+                    }
+                    else {
+                        Start-Sleep -Milliseconds 100
+                    }
+                }
+            }
             return $true
         }
         catch {
