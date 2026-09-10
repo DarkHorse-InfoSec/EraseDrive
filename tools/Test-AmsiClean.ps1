@@ -49,6 +49,19 @@
     .\tools\Test-AmsiClean.ps1 -ModulePath C:\Temp\ED-smoke\EraseDrive
     Checks an extracted release archive, which is what a customer actually gets.
 
+    WHAT A PASS DOES NOT PROVE
+    This exercises whichever antivirus is installed on the machine running it,
+    and one engine's opinion is not every engine's. On the development MSI the
+    active engine is Bitdefender, because Defender is passive there, so a pass on
+    that machine means "Bitdefender does not detect this" and nothing more. It
+    says nothing about Microsoft Defender, which is what most customers actually
+    run.
+
+    Before a release, run this where Defender is the ACTIVE engine, and record
+    which engine produced the result. Treating a pass obtained in a configuration
+    nobody ships into as proof of a clean product is the same mistake that caused
+    v3.1.0 to be withdrawn, wearing different clothes.
+
 .OUTPUTS
     Exit code 0 when every file parsed. Non-zero when anything was blocked or
     failed to parse. Intended to gate a release.
@@ -84,9 +97,23 @@ if (-not (Test-Path -LiteralPath $ModulePath)) {
 $repoQualifier    = (Split-Path -Qualifier (Resolve-Path -LiteralPath $repoRoot).Path)
 $stagingQualifier = (Split-Path -Qualifier (Resolve-Path -LiteralPath $StagingRoot).Path)
 
+# Name the engine that produced this verdict. A result that does not say which
+# antivirus it consulted invites being read as "the product is clean".
+$engines = @()
+try {
+    $engines = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop |
+               ForEach-Object {
+                   $realtime = ((([int]$_.productState -shr 12) -band 0xF) -ne 0)
+                   '{0}{1}' -f $_.displayName, $(if ($realtime) { ' [ACTIVE]' } else { ' (inactive)' })
+               }
+}
+catch { $engines = @('could not enumerate') }
+
 Write-Host "Module    : $ModulePath"
 Write-Host "Staging   : $StagingRoot"
 Write-Host "Repo vol  : $repoQualifier  (excluded from scanning on this machine)"
+Write-Host "Engines   : $($engines -join ', ')"
+Write-Host "            A verdict below reflects the ACTIVE engine only."
 
 if ($repoQualifier -eq $stagingQualifier) {
     Write-Host ''

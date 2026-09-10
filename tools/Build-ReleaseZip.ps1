@@ -234,6 +234,23 @@ if (-not (Test-Path -LiteralPath $gateScript)) {
     throw "Release gate missing: $gateScript. Refusing to call this archive releasable."
 }
 
+# A gate that cannot RUN exits non-zero, which is indistinguishable from a gate
+# that ran and found a detection. The direction is safe, since both stop the
+# release, but the two mean completely different things and confusing them sends
+# someone hunting a detection that is not there. A syntax error in the gate was
+# doing exactly that. So the gate is parsed before it is trusted.
+$gateErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseFile($gateScript, [ref] $null, [ref] $gateErrors)
+if ($gateErrors) {
+    Write-Host ''
+    Write-Host 'THE RELEASE GATE ITSELF IS BROKEN. This is a tooling fault, NOT a detection.' -ForegroundColor Red
+    $gateErrors | Select-Object -First 3 | ForEach-Object {
+        Write-Host ("  line {0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) -ForegroundColor Red
+    }
+    Write-Host 'Fix the gate, then rebuild. Nothing has been proven about the archive.' -ForegroundColor Red
+    exit 4
+}
+
 $gateStage = Join-Path $env:TEMP ('EraseDrive-relgate-' + [guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -Path $gateStage -ItemType Directory -Force | Out-Null
 try {
