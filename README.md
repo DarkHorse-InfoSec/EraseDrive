@@ -677,7 +677,21 @@ Logs are stored in `%ProgramData%\DarkHorse\EraseDrive\EraseDrive.log` with auto
 
 ## Version History
 
-### v3.1.0 (Current)
+### v3.1.0 - NOT RELEASED (withdrawn 2026-09-10)
+
+> **There is no v3.1.0 download.** It was published on 2026-09-10 and withdrawn
+> the same day, before any announcement, because the release archive could not be
+> loaded on a machine with active antivirus: one file,
+> `Private\Test-EraseVerification.ps1`, is flagged as malicious by at least one
+> engine, which prevents the whole module from importing. That is a false
+> positive on a read-only verification function, and it is being pursued with the
+> vendor rather than worked around in the code. See the antivirus entry under
+> Troubleshooting.
+>
+> The changes below are on `main` and are real; what does not exist is a release
+> built from them. `tools\Test-AmsiClean.ps1` now gates every future release on
+> this question, and the build refuses to call an archive releasable until it
+> passes.
 
 **Read this first if you used v3.0.0.** That version could report a successful,
 verified erase without ever having written to the disk. If you wiped a drive with
