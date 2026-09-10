@@ -624,6 +624,46 @@ execution policy. You have two options:
 If you cloned with `git clone` rather than downloading a ZIP, the MOTW marker
 is not applied and `RemoteSigned` alone is sufficient.
 
+### "This script contains malicious content and has been blocked by your antivirus software"
+
+Some antivirus products flag `EraseDrive\Private\Test-EraseVerification.ps1`
+and refuse to let the module load. This is a false positive, and it is worth
+explaining rather than waving away.
+
+**What that file does.** It is the function that checks an erase actually worked.
+It opens the physical disk **read-only**, seeks to randomly chosen sector offsets,
+reads them, and compares the bytes against the pattern the erase was supposed to
+write. It writes nothing. If the erase did not happen, this is the code that says
+so instead of issuing you a certificate.
+
+**Why it gets flagged.** Reading raw sectors off `\.\PhysicalDrive` from a
+script is a pattern that heuristic engines associate with wiper malware. It is
+also, unavoidably, how you verify a wipe. A tool that erases disks is going to
+resemble a tool that erases disks. We would rather be flagged than ship a wiper
+that cannot prove its own work.
+
+**What to do:**
+
+1. **Check the file yourself.** It is a few hundred lines of readable PowerShell,
+   the project is Apache-2.0, and the source is on GitHub. Do not take our word
+   for it, and do not take your scanner's word for it either.
+2. **Verify the archive** against the SHA256 published on the release page before
+   trusting anything about it.
+3. **Add an exclusion for the folder you extracted to**, if your own policy allows
+   it, or restore the file from quarantine.
+4. **Report it to your antivirus vendor as a false positive.** This is the fix
+   that helps everyone rather than just you, and vendors act on these.
+
+**What we will not do:** rewrite that function to score lower against a
+classifier. It would look like a fix, it could not be verified, and it would come
+back the next time the vendor updated their model. The detection is what needs
+correcting.
+
+Every release is checked against this before publishing, by
+`tools\Test-AmsiClean.ps1`, which loads the built archive from outside the
+development machine's excluded paths. If a release ships despite a known
+detection, it is named here.
+
 ### "No suitable disks found"
 Normal if you only have one system disk. The system disk appears in blue and supports user data wipe only.
 
