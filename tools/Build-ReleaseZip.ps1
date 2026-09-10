@@ -214,3 +214,46 @@ if ($problems.Count -gt 0) {
 
 Write-Host ''
 Write-Host 'Archive verified: required content present, nothing forbidden.' -ForegroundColor Green
+
+# ---------------------------------------------------------------------------
+# RELEASE GATE: will an antivirus actually let a customer load this?
+# ---------------------------------------------------------------------------
+# v3.1.0 was published and withdrawn the same hour because nobody had ever loaded
+# the module from outside the repository volume, which is on an AV exclusion. The
+# content check above proves the right FILES are in the archive; it says nothing
+# about whether the machine receiving them will permit them to run.
+#
+# The archive is deliberately NOT deleted when this gate fails. It is the exact
+# artifact that has to be submitted to the antivirus vendor as a false positive,
+# so it needs to survive. The non-zero exit is what stops the release.
+Write-Host ''
+Write-Host 'Running the antivirus load gate against the built archive...' -ForegroundColor Cyan
+
+$gateScript = Join-Path $PSScriptRoot 'Test-AmsiClean.ps1'
+if (-not (Test-Path -LiteralPath $gateScript)) {
+    throw "Release gate missing: $gateScript. Refusing to call this archive releasable."
+}
+
+$gateStage = Join-Path $env:TEMP ('EraseDrive-relgate-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -Path $gateStage -ItemType Directory -Force | Out-Null
+try {
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $gateStage)
+    $extractedModule = Join-Path $gateStage 'EraseDrive'
+
+    & $gateScript -ModulePath $extractedModule
+    $gateExit = $LASTEXITCODE
+
+    if ($gateExit -ne 0) {
+        Write-Host ''
+        Write-Host 'RELEASE GATE FAILED.' -ForegroundColor Red
+        Write-Host "The archive at $zipPath has been KEPT so it can be submitted to the" -ForegroundColor Red
+        Write-Host 'antivirus vendor as a false positive. It must NOT be released.' -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host ''
+    Write-Host 'Release gate passed: the shipped archive loads cleanly off-volume.' -ForegroundColor Green
+}
+finally {
+    Remove-Item -LiteralPath $gateStage -Recurse -Force -ErrorAction SilentlyContinue
+}
