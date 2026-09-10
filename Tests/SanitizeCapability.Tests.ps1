@@ -223,7 +223,101 @@ Describe 'ConvertFrom-AtaIdentifyDevice' {
         $r = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word82 0x0002 -Word128 0x0020)
         $r.SecurityLocked        | Should -BeFalse
         $r.SupportsEnhancedErase | Should -BeTrue
-        $r.PurgeMethods          | Should -Contain 'ATA SECURITY ERASE UNIT, enhanced'
+        # It is always REPORTED. Whether it is CREDITED as Purge depends on the
+        # media type, which is the subject of the next Describe block. This
+        # assertion used to read PurgeMethods, and that was the over-claim.
+        $r.ReportedCommands      | Should -Contain 'ATA SECURITY ERASE UNIT, enhanced'
+    }
+}
+
+Describe 'Purge crediting follows the media type, per NIST SP 800-88 Rev.1 Appendix A' {
+
+    # Verified against the published standard on 2026-09-10:
+    #   https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-88r1.pdf
+    #
+    #   Command                 Rotational (p.32)   Flash (p.36)
+    #   CRYPTO SCRAMBLE EXT     Purge               Purge
+    #   OVERWRITE EXT           Purge               not listed
+    #   BLOCK ERASE EXT         not listed          Purge
+    #   SECURITY ERASE UNIT     Purge (enhanced)    Clear only
+    #
+    # "Whereas ATA Secure Erase was a Purge mechanism for magnetic media, it is
+    #  only a Clear mechanism for flash memory due to variability in
+    #  implementation and the possibility that sensitive data may remain in areas
+    #  such as spare cells that have been rotated out of use." (printed p.36)
+
+    It 'Does NOT credit SECURITY ERASE UNIT as Purge on flash' {
+        # This is the regression guard for a real over-claim: the shipped version
+        # credited this on every media type, which would have put an unearned
+        # Purge claim on the certificate of any SSD reporting enhanced erase.
+        $ssd = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word82 0x0002 -Word128 0x0020) -MediaType 'SSD'
+        $ssd.PurgeMethods     | Should -BeNullOrEmpty
+        $ssd.ReportedCommands | Should -Contain 'ATA SECURITY ERASE UNIT, enhanced' -Because 'declining to credit must never mean hiding'
+    }
+
+    It 'Credits SECURITY ERASE UNIT as Purge on rotational media' {
+        $hdd = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word82 0x0002 -Word128 0x0020) -MediaType 'HDD'
+        $hdd.PurgeMethods | Should -Contain 'ATA SECURITY ERASE UNIT, enhanced'
+    }
+
+    It 'Credits OVERWRITE EXT on rotational media and not on flash' {
+        $w = [uint16]0x5000   # bit 12 SANITIZE feature set + bit 14 OVERWRITE EXT
+        (ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 $w) -MediaType 'HDD').PurgeMethods |
+            Should -Contain 'ATA SANITIZE, OVERWRITE EXT'
+        (ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 $w) -MediaType 'SSD').PurgeMethods |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Credits BLOCK ERASE EXT on flash and not on rotational media' {
+        $w = [uint16]0x9000   # bit 12 SANITIZE feature set + bit 15 BLOCK ERASE EXT
+        (ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 $w) -MediaType 'SSD').PurgeMethods |
+            Should -Contain 'ATA SANITIZE, BLOCK ERASE EXT'
+        (ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 $w) -MediaType 'HDD').PurgeMethods |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Credits CRYPTO SCRAMBLE EXT on every media type, including unknown' {
+        foreach ($m in 'SSD', 'HDD', 'Unknown') {
+            (ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 0x3000) -MediaType $m).PurgeMethods |
+                Should -Contain 'ATA SANITIZE, CRYPTO SCRAMBLE EXT' -Because "it is on both lists, so it is credited on $m"
+        }
+    }
+
+    It 'Defers rather than denies when the media type is unknown' {
+        # The three-state rule applied to the media type. A command that purges a
+        # platter but not flash cannot be judged without knowing which this is,
+        # and "cannot be judged" must not be recorded as "cannot be purged".
+        $r = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 0x5000 -Word82 0x0002 -Word128 0x0020)
+        $r.MediaType                | Should -Be 'Unknown'
+        $r.PurgeMethods             | Should -BeNullOrEmpty
+        $r.MediaDependentUncredited | Should -Contain 'ATA SANITIZE, OVERWRITE EXT'
+        $r.MediaDependentUncredited | Should -Contain 'ATA SECURITY ERASE UNIT, enhanced'
+    }
+
+    It 'Never credits a command it did not also report, over the full cross-product' {
+        # The invariant, asserted over every media type crossed with every word 59
+        # combination and both enhanced-erase states, rather than over one
+        # illustrative drive.
+        foreach ($media in 'SSD', 'HDD', 'Unknown') {
+            for ($combo = 0; $combo -le 15; $combo++) {
+                $word = [uint16](($combo -shl 12) -band 0xFFFF)
+                foreach ($sec in @([uint16]0x0000, [uint16]0x0020)) {
+                    $r = ConvertFrom-AtaIdentifyDevice (New-AtaIdentify -Word59 $word -Word82 0x0002 -Word128 $sec) -MediaType $media
+                    $why = "media=$media word59=0x$('{0:X4}' -f $word) word128=0x$('{0:X4}' -f $sec)"
+
+                    foreach ($m in $r.PurgeMethods) {
+                        $r.ReportedCommands | Should -Contain $m -Because "credited but not reported: $why"
+                    }
+                    if ($media -eq 'SSD') {
+                        $r.PurgeMethods | Should -Not -Contain 'ATA SECURITY ERASE UNIT, enhanced' -Because "Clear only on flash: $why"
+                        $r.PurgeMethods | Should -Not -Contain 'ATA SANITIZE, OVERWRITE EXT'       -Because "not in the flash Purge list: $why"
+                    }
+                    if ($media -eq 'HDD') {
+                        $r.MediaDependentUncredited | Should -BeNullOrEmpty -Because "nothing is deferred once the medium is known: $why"
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -295,6 +389,37 @@ Describe 'Get-DiskSanitizeCapability' {
         # The certificate line must state availability, never achievement.
         $r.EvidenceSummary | Should -BeLike '*NOT PERFORMED*'
         $r.EvidenceSummary | Should -BeLike '*Sanitization achieved: Clear*'
+    }
+
+    It 'Reports PurgeCapable as $null when the credit depends on a media type it could not identify' {
+        # Get-PhysicalDisk reports 'Unspecified' more often than is comfortable,
+        # and the answer for a drive whose only qualifying command is
+        # media-dependent is UNKNOWN, not "cannot be purged".
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' { [PSCustomObject]@{ DeviceId = '1'; BusType = 'SATA'; MediaType = 'Unspecified'; FriendlyName = 'D'; SerialNumber = 'S' } }
+        Mock Get-StorageIdentifyData {
+            [PSCustomObject]@{ Success = $true; Error = $null
+                               Data = (New-AtaIdentify -Word59 0x5000) }
+        }
+
+        $r = Get-DiskSanitizeCapability -DiskNumber 1
+
+        $null -eq $r.PurgeCapable | Should -BeTrue -Because 'an unidentified medium is not a refusal'
+        $r.DeviceAnswered  | Should -BeTrue
+        $r.EvidenceSummary | Should -BeLike '*UNKNOWN, not absent*'
+        ($r.Blockers -join ' ') | Should -BeLike '*media type could not be identified*'
+    }
+
+    It 'Still reports a definite answer once the medium IS identified' {
+        Mock Get-PhysicalDisk -RemoveParameterType 'Usage','HealthStatus','VirtualDisk' { [PSCustomObject]@{ DeviceId = '1'; BusType = 'SATA'; MediaType = 'HDD'; FriendlyName = 'D'; SerialNumber = 'S' } }
+        Mock Get-StorageIdentifyData {
+            [PSCustomObject]@{ Success = $true; Error = $null
+                               Data = (New-AtaIdentify -Word59 0x5000) }
+        }
+
+        $r = Get-DiskSanitizeCapability -DiskNumber 1
+
+        $r.PurgeCapable  | Should -BeTrue
+        $r.PurgeMethods  | Should -Contain 'ATA SANITIZE, OVERWRITE EXT'
     }
 
     It 'Surfaces the ATA freeze lock as a blocker with the remedy' {

@@ -21,7 +21,9 @@ function Get-DiskSanitizeCapability {
             $false  Purge is definitively NOT reachable, either because the
                     device answered and reported no qualifying command, or
                     because the bus cannot carry one at all (USB, virtual)
-            $null   UNKNOWN: the device was never asked, or the query failed
+            $null   UNKNOWN: the device was never asked, the query failed, or
+                    the only qualifying commands it reports are ones whose Purge
+                    credit depends on a media type that could not be identified
 
         $null must never collapse to $false. "We could not determine this" and
         "this drive cannot be purged" are different facts, and a certificate that
@@ -162,7 +164,17 @@ function Get-DiskSanitizeCapability {
         $parsed = ConvertFrom-NvmeIdentifyController -Bytes $query.Data
     }
     else {
-        $parsed = ConvertFrom-AtaIdentifyDevice -Bytes $query.Data
+        # The media type is REQUIRED to interpret the answer, because SP 800-88
+        # Rev.1 credits different commands as Purge on rotational and on flash
+        # media. Normalised the same way Get-DiskMediaType does it; anything we
+        # cannot positively identify stays 'Unknown' and is handled below rather
+        # than being assumed either way.
+        $normalisedMedia = switch ($mediaType) {
+            'SSD'   { 'SSD' }
+            'HDD'   { 'HDD' }
+            default { 'Unknown' }
+        }
+        $parsed = ConvertFrom-AtaIdentifyDevice -Bytes $query.Data -MediaType $normalisedMedia
         if ($parsed.Parsed) {
             $result.SecurityFrozen = $parsed.SecurityFrozen
         }
@@ -180,8 +192,22 @@ function Get-DiskSanitizeCapability {
     $result.Determination  = 'Queried'
     $result.DeviceAnswered = $true
     $result.PurgeMethods   = @($parsed.PurgeMethods)
-    $result.PurgeCapable  = ($parsed.PurgeMethods.Count -gt 0)
-    $result.Raw           = $parsed.Raw
+    $result.PurgeCapable   = ($parsed.PurgeMethods.Count -gt 0)
+    $result.Raw            = $parsed.Raw
+
+    # THE THREE-STATE RULE, APPLIED TO THE MEDIA TYPE.
+    #
+    # A device can report a command that reaches Purge on one medium and not on
+    # another: SANITIZE OVERWRITE EXT purges a platter but is not credited on
+    # flash, and SECURITY ERASE UNIT is Purge on a platter but Clear only on
+    # flash. If we could not identify the medium, then whether this device can be
+    # purged is UNKNOWN, and it must not be recorded as $false. $false here would
+    # read as "the device answered and reported nothing qualifying", which is a
+    # different and stronger claim than the one the evidence supports.
+    $mediaPending = @($parsed.MediaDependentUncredited)
+    if (-not $result.PurgeCapable -and $mediaPending.Count -gt 0) {
+        $result.PurgeCapable = $null
+    }
 
     if ($parsed.ModelNumber)  { $result.FriendlyName = $parsed.ModelNumber }
     if ($parsed.SerialNumber) { $result.SerialNumber = $parsed.SerialNumber }
@@ -216,6 +242,13 @@ function Get-DiskSanitizeCapability {
         if ($blockers.Count -gt 0) {
             $summary += ' Outstanding blockers: ' + ($blockers -join ' ')
         }
+    }
+    elseif ($null -eq $result.PurgeCapable) {
+        $summary = 'Sanitization achieved: Clear. Purge capability could not be determined: the device reports ' +
+                   ($mediaPending -join '; ') +
+                   ", but whether that reaches Purge under NIST SP 800-88 Rev.1 depends on the media type, which could not be identified for this disk (reported as '$mediaType'). This is UNKNOWN, not absent."
+        $blockers += "The media type could not be identified, and every command this device reports is credited as Purge on one media type but not the other. Identify the medium before relying on a Purge claim."
+        $result.Blockers = $blockers
     }
     else {
         $summary = 'Sanitization achieved: Clear. The device reports no command that reaches Purge, so Purge is not available on this device.'

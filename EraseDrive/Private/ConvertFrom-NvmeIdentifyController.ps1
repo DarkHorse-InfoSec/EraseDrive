@@ -90,24 +90,40 @@ function ConvertFrom-NvmeIdentifyController {
     $sanitizeBlock     = [bool]($sanicap -band 0x2)
     $sanitizeOverwrite = [bool]($sanicap -band 0x4)
 
-    # Which of these count as Purge is a DELIBERATELY CONSERVATIVE choice, and it
-    # is not a verbatim reading of the standard.
+    # Which of these count as Purge. CHECKED against the published standard on
+    # 2026-09-10, NIST SP 800-88 Rev.1 Appendix A, Table A-8, section "NVM Express
+    # SSDs" (printed p.38):
+    #   https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-88r1.pdf
     #
-    # NIST SP 800-88 Rev.1 is dated 2014 and predates the NVMe Sanitize command
-    # (NVMe 1.3, 2017), so Appendix A cannot name it. Crediting Sanitize block and
-    # crypto erase as Purge is therefore an inference from the way the same
-    # document treats the equivalent ATA SANITIZE operations. Format NVM is
-    # different: Appendix A does address NVM Express directly.
+    # The standard DOES address NVM Express directly, and its Purge list is:
+    #   1. "Apply the NVM Express Format command, if supported. One or both of the
+    #       following options may be available: a. The User Data Erase command.
+    #       b. If the device supports encryption, the Cryptographic Erase command."
+    #   2. "Cryptographic Erase through the TCG Opal SSC or Enterprise SSC
+    #       interface by issuing commands as necessary to cause all MEKs to be
+    #       changed."
+    # So crediting Format NVM with SES=1 or SES=2 is a VERBATIM reading, not an
+    # inference. This is also why Phase 2 targets Format NVM: it is the command
+    # the standard actually names for this media type.
     #
-    # Sanitize Overwrite is reported but NOT credited as Purge, because a
-    # controller-driven overwrite still reaches only mapped blocks and leaves
-    # over-provisioned, retired and un-erased flash untouched. NOTE that this is
-    # STRICTER than the standard appears to be for ATA, where SANITIZE OVERWRITE
-    # EXT is listed among the Purge techniques. Erring toward under-claiming is
-    # the right direction for a compliance certificate, but the exact position
-    # should be checked against SP 800-88 Rev.1 Appendix A before Phase 2 ships,
-    # and this comment corrected either way. No copy of the standard was
-    # available on the machine where this was written.
+    # CREDITING NVMe SANITIZE IS STILL AN INFERENCE, and is labelled as one.
+    # SP 800-88 Rev.1 is dated 2014 and the NVMe Sanitize command arrived in NVMe
+    # 1.3 in 2017, so the document cannot and does not name it. Sanitize block
+    # erase and crypto erase are credited here by analogy with the ATA SANITIZE
+    # operations that the same document credits on flash media. The analogy is
+    # strong, since NVMe Sanitize is the stronger operation and applies to the
+    # whole NVM subsystem rather than a namespace, but it is an argument and not a
+    # citation. A certificate that rests on it must say so.
+    #
+    # Sanitize Overwrite is reported but NOT credited. This is now known to AGREE
+    # with the standard rather than being stricter than it: the earlier comment
+    # here claimed Appendix A lists SANITIZE OVERWRITE EXT among the ATA Purge
+    # techniques, which is true ONLY for rotational ATA drives (printed p.32).
+    # For flash, the ATA SSD Purge list (printed p.36) offers block erase and
+    # crypto scramble and does NOT include overwrite, for exactly the reason that
+    # applies here: a controller-driven overwrite reaches only mapped blocks and
+    # leaves over-provisioned, retired and un-erased flash untouched. NVMe is
+    # flash, so the flash list is the applicable one.
     $purgeMethods = @()
     if ($sanitizeCrypto)    { $purgeMethods += 'NVMe Sanitize, crypto erase' }
     if ($sanitizeBlock)     { $purgeMethods += 'NVMe Sanitize, block erase' }

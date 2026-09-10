@@ -33,6 +33,12 @@ function ConvertFrom-AtaIdentifyDevice {
         names DFIR as an explicit gap). The word 128 and word 82/85 assignments
         are the long-standing, widely implemented ones and are not in doubt.
 
+        Separately, the NIST half of this deferral is NO LONGER OPEN. Which of
+        these commands is credited as Purge was verified against the published
+        SP 800-88 Rev.1 on 2026-09-10, and the crediting block below now cites
+        it directly. That verification says nothing about the bit positions
+        above, which are a different question against a different standard.
+
         This is safe to ship in Phase 1 because Phase 1 only REPORTS, and the raw
         word is always returned alongside the interpretation so a wrong bit is
         visible rather than silent. It is NOT safe to ship in Phase 3, where the
@@ -55,7 +61,16 @@ function ConvertFrom-AtaIdentifyDevice {
         # a caller handling that exception would be one short step from treating
         # "no data" as "no capabilities".
         [AllowEmptyCollection()]
-        [byte[]] $Bytes
+        [byte[]] $Bytes,
+
+        # Which commands reach Purge depends on the media type, and NIST SP
+        # 800-88 Rev.1 Appendix A gives two different lists. See the crediting
+        # block below. 'Unknown' is the safe default: it credits only what both
+        # lists agree on and defers the rest to MediaDependentUncredited, rather
+        # than guessing a media type in the tool's own favour.
+        [Parameter(Position = 1)]
+        [ValidateSet('SSD', 'HDD', 'Unknown')]
+        [string] $MediaType = 'Unknown'
     )
 
     if ($null -eq $Bytes -or $Bytes.Length -lt 512) {
@@ -75,7 +90,10 @@ function ConvertFrom-AtaIdentifyDevice {
             SecurityEnabled       = $null
             SecurityLocked        = $null
             SecurityFrozen        = $null
+            MediaType             = $MediaType
+            ReportedCommands      = @()
             PurgeMethods          = @()
+            MediaDependentUncredited = @()
             Raw                   = $null
         }
     }
@@ -112,22 +130,92 @@ function ConvertFrom-AtaIdentifyDevice {
     $secFrozen         = [bool]($word128 -band 0x0008)
     $enhancedErase     = [bool]($word128 -band 0x0020)
 
-    # Only block erase and crypto scramble are credited as Purge. OVERWRITE EXT is
-    # reported because the device advertises it, but is not credited, because a
-    # controller-driven overwrite does not reach over-provisioned or retired
-    # flash blocks, which is the whole reason overwriting cannot Purge an SSD.
+    # Everything the device advertises, credited or not. Reported separately so
+    # that declining to credit a command is never the same thing as hiding it.
+    $reported = @()
+    if ($sanitizeSupported -and $cryptoScramble) { $reported += 'ATA SANITIZE, CRYPTO SCRAMBLE EXT' }
+    if ($sanitizeSupported -and $blockErase)     { $reported += 'ATA SANITIZE, BLOCK ERASE EXT' }
+    if ($sanitizeSupported -and $overwriteExt)   { $reported += 'ATA SANITIZE, OVERWRITE EXT' }
+    if ($securitySupported -and $enhancedErase)  { $reported += 'ATA SECURITY ERASE UNIT, enhanced' }
+
+    # ------------------------------------------------------------------------
+    # WHICH COMMANDS COUNT AS PURGE IS MEDIA-TYPE DEPENDENT.
+    # ------------------------------------------------------------------------
+    # Verified 2026-09-10 against the published standard, NIST SP 800-88 Rev.1,
+    # Appendix A, Table A-5 (magnetic media) and Table A-8 (flash memory):
+    #   https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-88r1.pdf
     #
-    # This is STRICTER than NIST SP 800-88 Rev.1 appears to be: Appendix A lists
-    # SANITIZE OVERWRITE EXT among the ATA Purge techniques. Under-claiming is the
-    # safe direction for a compliance certificate, and on a rotational ATA drive
-    # the objection above does not apply, so this may be worth relaxing for HDDs
-    # specifically. Check against Appendix A before Phase 3 ships and correct this
-    # comment either way; no copy of the standard was available on the machine
-    # where this was written.
+    # "ATA Hard Disk Drives" (printed p.32), under Purge:
+    #   1a. "The overwrite EXT command. Apply one write pass of a fixed pattern
+    #        across the media surface. ... A single write pass should suffice to
+    #        Purge the media."
+    #   1b. "... the Cryptographic Erase (also known as CRYPTO SCRAMBLE EXT)
+    #        command."
+    #   2.  "Use the ATA Security feature set's SECURE ERASE UNIT command, if
+    #        support, in Enhanced Erase mode." [sic] "The ATA Sanitize Device
+    #        feature set commands are preferred over the ... SECURITY ERASE UNIT
+    #        command when supported by the ATA device."
+    #
+    # "ATA Solid State Drives (SSDs)" (printed p.36), under Purge:
+    #   1a. "The block erase command."
+    #   1b. "If the device supports encryption, the Cryptographic Erase (also
+    #        known as sanitize crypto scramble) command."
+    #   and in that section's Notes, decisively:
+    #   "Whereas ATA Secure Erase was a Purge mechanism for magnetic media, it is
+    #    only a Clear mechanism for flash memory due to variability in
+    #    implementation and the possibility that sensitive data may remain in
+    #    areas such as spare cells that have been rotated out of use."
+    #   In that same section SECURITY ERASE UNIT appears under CLEAR, not Purge,
+    #   and SANITIZE OVERWRITE EXT does not appear in the flash Purge list at all.
+    #
+    # The resulting credit table:
+    #
+    #   Command                 Rotational        Flash
+    #   CRYPTO SCRAMBLE EXT     Purge             Purge
+    #   OVERWRITE EXT           Purge             not listed  (do not credit)
+    #   BLOCK ERASE EXT         not listed        Purge
+    #   SECURITY ERASE UNIT     Purge (enhanced)  CLEAR ONLY  (do not credit)
+    #
+    # This corrects two errors in the version that credited without knowing the
+    # media type. It OVER-claimed, by crediting SECURITY ERASE UNIT on flash,
+    # which is the direction that puts an unearned compliance claim on a
+    # certificate. It also UNDER-claimed, by refusing OVERWRITE EXT on rotational
+    # drives, where the standard credits a single pass in as many words.
+    #
+    # UNKNOWN MEDIA TYPE credits only the intersection, which is CRYPTO SCRAMBLE
+    # EXT alone. Anything media-dependent goes to MediaDependentUncredited so the
+    # caller reports UNKNOWN rather than "this device cannot be purged". A media
+    # type we failed to read and a device that answered no are different facts,
+    # and collapsing them is the same defect as a failed query reported as a
+    # refusal.
     $purgeMethods = @()
-    if ($sanitizeSupported -and $cryptoScramble) { $purgeMethods += 'ATA SANITIZE, CRYPTO SCRAMBLE EXT' }
-    if ($sanitizeSupported -and $blockErase)     { $purgeMethods += 'ATA SANITIZE, BLOCK ERASE EXT' }
-    if ($securitySupported -and $enhancedErase)  { $purgeMethods += 'ATA SECURITY ERASE UNIT, enhanced' }
+    $mediaPending = @()
+
+    if ($sanitizeSupported -and $cryptoScramble) {
+        # Credited on every media type; no branch needed.
+        $purgeMethods += 'ATA SANITIZE, CRYPTO SCRAMBLE EXT'
+    }
+    if ($sanitizeSupported -and $blockErase) {
+        switch ($MediaType) {
+            'SSD'   { $purgeMethods += 'ATA SANITIZE, BLOCK ERASE EXT' }
+            'HDD'   { }   # absent from the rotational Purge list
+            default { $mediaPending += 'ATA SANITIZE, BLOCK ERASE EXT' }
+        }
+    }
+    if ($sanitizeSupported -and $overwriteExt) {
+        switch ($MediaType) {
+            'HDD'   { $purgeMethods += 'ATA SANITIZE, OVERWRITE EXT' }
+            'SSD'   { }   # absent from the flash Purge list
+            default { $mediaPending += 'ATA SANITIZE, OVERWRITE EXT' }
+        }
+    }
+    if ($securitySupported -and $enhancedErase) {
+        switch ($MediaType) {
+            'HDD'   { $purgeMethods += 'ATA SECURITY ERASE UNIT, enhanced' }
+            'SSD'   { }   # Clear only on flash, per the Notes quoted above
+            default { $mediaPending += 'ATA SECURITY ERASE UNIT, enhanced' }
+        }
+    }
 
     [PSCustomObject]@{
         Parsed                 = $true
@@ -144,7 +232,10 @@ function ConvertFrom-AtaIdentifyDevice {
         SecurityEnabled        = $securityEnabled
         SecurityLocked         = $secLocked
         SecurityFrozen         = $secFrozen
+        MediaType              = $MediaType
+        ReportedCommands       = $reported
         PurgeMethods           = $purgeMethods
+        MediaDependentUncredited = $mediaPending
         Raw                    = [ordered]@{
             Word59  = ('0x{0:X4}' -f $word59)
             Word82  = ('0x{0:X4}' -f $word82)
