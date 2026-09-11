@@ -139,7 +139,45 @@ if (-not $signtool) {
     return
 }
 
+# ---------------------------------------------------------------------------
+# WARNING: THIS SIGNING PATH CANNOT WORK WITH ANY CERTIFICATE BOUGHT TODAY.
+# ---------------------------------------------------------------------------
+# `signtool sign /f <pfx> /p <password>` signs from a PFX file holding the
+# private key. Since 1 June 2023 the CA/Browser Forum baseline requirements have
+# required code-signing private keys to live on FIPS 140-2 Level 2 or Common
+# Criteria EAL4+ hardware, and no certificate authority issues a downloadable
+# PFX for a new code-signing certificate any more. Verified 2026-09-10 against
+# DigiCert's and GlobalSign's own advisories.
+#
+# So this script encodes an assumption that cannot be satisfied. It is left here
+# rather than guessed at, because the correct replacement depends on a decision
+# that has not been made yet:
+#
+#   Physical USB token (Sectigo, SSL.com, GlobalSign):
+#       signtool sign /csp "<CSP name>" /kc "[{{<pin>}}]=<container>" /f <cer> ...
+#     or via the token vendor's own KSP. Manual signing only: the token has to be
+#     plugged into the machine doing the signing, which rules out unattended CI.
+#
+#   Azure Trusted Signing / Artifact Signing:
+#       signtool sign /v /debug /dlib <path to Azure.CodeSigning.Dlib.dll>
+#                     /dmdf <metadata.json> ...
+#     Key never leaves Microsoft's HSM. Works unattended.
+#
+#   SignPath.io:
+#     Does not use signtool at all. Artifacts are submitted to SignPath and come
+#     back signed, so this whole block is replaced rather than adapted.
+#
+# The installer is deferred to v3.2 and is not in the v3.1.x release path, so
+# this is not currently blocking anything. It WILL block the moment someone
+# tries to sign, which is why it is written down here rather than discovered
+# then. See tasks/code-signing-decision.md.
+# ---------------------------------------------------------------------------
+
 Write-Host "Signing installer with $signtool..." -ForegroundColor Cyan
+Write-Warning ("This script signs from a PFX file. No code-signing certificate issued " +
+               "since 2023-06-01 can be exported to a PFX, so this path only works with " +
+               "a pre-2023 certificate or a self-signed test certificate. See the comment " +
+               "block above and tasks/code-signing-decision.md.")
 
 $signArgs = @('sign', '/f', $PfxPath)
 if ($PfxPassword) { $signArgs += @('/p', $PfxPassword) }
